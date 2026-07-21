@@ -10,6 +10,7 @@ import calendar
 import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 CDP_URL = "http://127.0.0.1:9222"
 MONGO_URI = "mongodb://localhost:27017/"
@@ -128,3 +129,136 @@ def rescue_orphaned_processing(coll_list) -> int:
          "$unset": {"detail_started_at": ""}},
     )
     return r.modified_count
+
+
+class ParseError(Exception):
+    """详情页结构无法识别时抛出。被 run_one 捕获并标 failed。"""
+
+
+def _text(element) -> str:
+    """提取并规范化 BeautifulSoup 元素文本。"""
+    return element.get_text(" ", strip=True) if element else ""
+
+
+
+def _as_int(value: str) -> int:
+    """将页面中的非负整数字符串转换为 int。"""
+    normalized = value.replace(",", "").strip()
+    return int(normalized) if normalized.isdigit() else 0
+
+
+def parse_detail(html: str, detail_url: str) -> dict:
+    """将 1337x 详情页 HTML 解析为 bt_info_detail 文档。"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    if not soup.select_one("div.torrent-detail, div.box-info-heading"):
+        raise ParseError(f"详情页结构无法识别: {detail_url}")
+
+    heading = soup.select_one("div.box-info-heading h1, h1")
+    name = _text(heading)
+    title_element = soup.select_one("div.torrent-detail-info h3 a, div.torrent-detail-info h3")
+    title = (_text(title_element) or name).upper()
+
+    meta = {}
+    for row in soup.select("ul.list li"):
+        key_element = row.select_one("strong")
+        value_element = row.select_one("span")
+        if key_element and value_element:
+            key = _text(key_element).rstrip(":").strip().lower()
+            meta[key] = _text(value_element)
+
+    ref_now = datetime.now()
+    date_uploaded = parse_relative_time(meta.get("date uploaded", ""), ref_now)
+    last_checked = parse_relative_time(meta.get("last checked", ""), ref_now)
+
+    genre = " ".join(
+        filter(None, (_text(element) for element in soup.select("div.torrent-category span")))
+    ).upper()
+    tags = list(
+        filter(None, (_text(link) for link in soup.select("ul.category-name li a")))
+    )
+
+    infohash_box = soup.select_one("div.infohash-box")
+    match = re.search(
+        r"INFOHASH\s*:\s*([A-Fa-f0-9]{32,40})",
+        _text(infohash_box),
+        re.IGNORECASE,
+    )
+    info_hash = match.group(1) if match else ""
+
+    resource_links = {}
+    magnet_link = soup.select_one("a[href^='magnet:']")
+    if magnet_link and magnet_link.get("href"):
+        resource_links["magnet"] = magnet_link["href"]
+
+    for link_name, host in (
+        ("itorrents", "itorrents.org"),
+        ("torrage", "torrage.info"),
+        ("btcache", "btcache.me"),
+    ):
+        link = soup.select_one(f"a[href*='{host}']")
+        if link and link.get("href"):
+            resource_links[link_name] = link["href"]
+
+    stream_link = soup.select_one(
+        "div.torrent-detail-info a[href*='play'], "
+        "div.torrent-detail-info a[href*='stream']"
+    )
+    if stream_link and stream_link.get("href"):
+        resource_links["stream"] = stream_link["href"]
+
+    imdb_link = soup.select_one("a[href*='imdb.com/title/']")
+    imdb_href = imdb_link.get("href") if imdb_link else None
+    imdb_url = imdb_href if isinstance(imdb_href, str) else None
+
+    cover = soup.select_one("div.torrent-image img, img.poster")
+    cover_url = cover["src"] if cover and cover.get("src") else None
+
+    description_element = soup.select_one("div.torrent-detail-info .content-row p, div#description")
+    description = _text(description_element)
+
+    rating = None
+    rating_element = soup.select_one("div.torrent-rating")
+    if rating_element:
+        try:
+            rating = int(float(_text(rating_element)))
+        except ValueError:
+            pass
+
+    related_sites = []
+    for link in soup.select("div#description a[href^='http']"):
+        href = link.get("href", "")
+        if "imdb.com" in href or "1337x.to" in href:
+            continue
+        link_name = _text(link)
+        if link_name and href:
+            related_sites.append({"name": link_name, "url": href})
+
+    return {
+        "_id": hashlib.md5(detail_url.encode()).hexdigest(),
+        "detail_url": detail_url,
+        "name": name,
+        "category": meta.get("category", ""),
+        "type": meta.get("type", ""),
+        "language": meta.get("language", ""),
+        "total_size": meta.get("total size", ""),
+        "uploaded_by": meta.get("uploaded by", ""),
+        "downloads": _as_int(meta.get("downloads", "")),
+        "last_checked": last_checked,
+        "date_uploaded": date_uploaded,
+        "seeders": _as_int(meta.get("seeders", "")),
+        "leechers": _as_int(meta.get("leechers", "")),
+        "resource_links": resource_links,
+        "cover_url": cover_url,
+        "title": title,
+        "genre": genre,
+        "description": description,
+        "rating": rating,
+        "tags": tags,
+        "info_hash": info_hash,
+        "imdb_url": imdb_url,
+        "imdb_id": extract_imdb_id(imdb_url),
+        "related_sites": related_sites,
+        "c_time": now_str(),
+        "source": "1337x",
+    }
