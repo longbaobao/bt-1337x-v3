@@ -11,19 +11,28 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
 
-CDP_URL = "http://127.0.0.1:9222"
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "bt_13337x_spider_db"
-COLL_LIST = "bt_info_list"
-COLL_DETAIL = "bt_info_detail"
+# 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
+try:
+    from crawl_1337x import CDP_URL, MONGO_URI, DB_NAME, COLL_LIST, COLL_DETAIL
+except ModuleNotFoundError as exc:
+    if exc.name != "crawl_1337x":
+        raise
+    # 当前单关键词爬虫已重命名为 crawl_1337x_by_key.py；
+    # 它只导出 3 个共享常量（CDP_URL/MONGO_URI/DB_NAME），COLL_LIST/COLL_DETAIL 是 detail crawler 专用，保持本地
+    from crawl_1337x_by_key import CDP_URL, MONGO_URI, DB_NAME
+    COLL_LIST = "bt_info_list"
+    COLL_DETAIL = "bt_info_detail"
+
 HTML_DIR = Path("data/html")
 
 BATCH = 200
 MAX_RETRIES = 3
 RETRY_BACKOFF = (2, 4, 8)  # 秒
 RUN_ONE_BUDGET = 60  # 秒
+INTER_REQUEST_SLEEP = 0.5  # 秒，每次 fetch 成功后的间隔
+CONCURRENCY = 1  # 默认并行 page 数
 
 
 def now_str() -> str:
@@ -284,3 +293,253 @@ def save_html_cache(detail_url: str, html: str) -> None:
     HTML_DIR.mkdir(parents=True, exist_ok=True)
     path = html_cache_path(detail_url)
     path.write_text(html, encoding="utf-8")
+
+
+# ============================================================
+# 编排层（Task 7）
+# ============================================================
+import asyncio
+import argparse
+import time
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+
+async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
+    """处理单条 URL → 持久化一条记录。返回 'done' 或 'failed'。
+
+    单 URL 顺序：
+        claim（main loop 里完成）
+        → fetch HTML（或读缓存）
+        → parse_detail
+        → upsert_detail（非 dry_run）
+        → mark_done（非 dry_run）
+        → asyncio.sleep(INTER_REQUEST_SLEEP)
+        → 下一条
+
+    缓存命中：直接读 HTML，跳过 fetch + retry。
+    缓存未命中：retry loop 内 fetch + cache save + parse + save。
+    - PWTimeout / PWError → 重试 MAX_RETRIES 次（间或用 RETRY_BACKOFF）
+    - ParseError → 不重试，直接 failed
+    - 其他异常 → 重试 MAX_RETRIES 次
+    """
+    doc_id = doc["_id"]
+    url = doc["detail_url"]
+    short_id = doc_id[:8]
+    last_err = None
+
+    # 缓存命中分支：直接读 HTML，跳过 fetch + retry
+    cache_path = html_cache_path(url)
+    if cache_path.exists():
+        try:
+            html = cache_path.read_text(encoding="utf-8")
+        except OSError as e:
+            last_err = f"CacheReadError: {e}"
+            logger.error(f"[{short_id}] cache read failed: {e}")
+            if not dry_run:
+                mark_failed(coll_list, doc_id, last_err)
+            return "failed"
+        try:
+            parsed = parse_detail(html, url)
+        except ParseError as e:
+            last_err = f"ParseError: {e}"
+            logger.error(f"[{short_id}] parse failed (cached): {e}")
+            if not dry_run:
+                mark_failed(coll_list, doc_id, last_err)
+            return "failed"
+        if not dry_run:
+            upsert_detail(coll_detail, parsed)
+            mark_done(coll_list, doc_id)
+        await asyncio.sleep(INTER_REQUEST_SLEEP)
+        return "done"
+
+    # 缓存未命中：retry loop
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            html = await fetch_one(page, url)
+            save_html_cache(url, html)
+            parsed = parse_detail(html, url)
+            if not dry_run:
+                upsert_detail(coll_detail, parsed)
+                mark_done(coll_list, doc_id)
+            await asyncio.sleep(INTER_REQUEST_SLEEP)
+            return "done"
+        except PWTimeout as e:
+            last_err = f"PWTimeout: {e}"
+            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} timeout")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
+        except PWError as e:
+            last_err = f"PlaywrightError: {e}"
+            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} browser err")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
+        except ParseError as e:
+            last_err = f"ParseError: {e}"
+            logger.error(f"[{short_id}] parse failed: {e}")
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} unknown: {last_err}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
+
+    if not dry_run:
+        mark_failed(coll_list, doc_id, last_err or "unknown")
+    return "failed"
+
+
+async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, dry_run: bool) -> tuple[int, int]:
+    """开 N 个 page 并行跑一批 docs，返回 (done, failed)。
+
+    每个 task 用 asyncio.wait_for 包 run_one，强制 60s 总预算。
+    超时 → mark_failed + 返回 "failed"（并跳过 DB 写）。
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(doc):
+        async with sem:
+            page = await ctx.new_page()
+            try:
+                return await asyncio.wait_for(
+                    run_one(page, doc, coll_list, coll_detail, dry_run=dry_run),
+                    timeout=RUN_ONE_BUDGET,
+                )
+            except asyncio.TimeoutError:
+                if not dry_run:
+                    mark_failed(coll_list, doc["_id"], f"run_one exceeded {RUN_ONE_BUDGET}s budget")
+                return "failed"
+            finally:
+                await page.close()
+
+    results = await asyncio.gather(*[one(d) for d in docs], return_exceptions=True)
+    done = sum(1 for r in results if r == "done")
+    failed = sum(1 for r in results if r == "failed")
+    exceptions = sum(1 for r in results if isinstance(r, Exception))
+    if exceptions:
+        logger.error(f"  {exceptions} tasks raised exceptions")
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error(f"  exc: {type(r).__name__}: {r}")
+    return done, failed
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="1337x 详情页爬虫")
+    p.add_argument("-c", "--concurrency", type=int, default=CONCURRENCY, help="并行 page 数")
+    p.add_argument("-b", "--batch", type=int, default=BATCH, help="每批从 MongoDB 取多少条")
+    p.add_argument("-p", "--pace", type=float, default=1.0, help="批次间停顿秒数")
+    p.add_argument("-l", "--limit", type=int, default=0, help="最多处理多少条（0=不限）")
+    p.add_argument("-k", "--keyword", type=str, default=None, help="只处理指定 keyword")
+    p.add_argument("--force", action="store_true", help="无视 status 强制重跑")
+    p.add_argument("--retry-failed", action="store_true", help="重置 failed → pending 后再跑")
+    p.add_argument("--dry-run", action="store_true", help="只解析不写")
+    return p.parse_args()
+
+
+async def main() -> None:
+    args = parse_args()
+    from pymongo import MongoClient
+    client = MongoClient(MONGO_URI)
+    coll_list = client[DB_NAME][COLL_LIST]
+    coll_detail = client[DB_NAME][COLL_DETAIL]
+
+    # --force: 重置全部为 pending
+    if args.force:
+        r = coll_list.update_many(
+            {},
+            {"$set": {"detail_status": "pending"},
+             "$unset": {"detail_started_at": "",
+                        "detail_processed_at": "",
+                        "detail_error": ""}},
+        )
+        logger.info(f"--force: 重置 {r.modified_count} 条 → pending")
+
+    # --retry-failed: 仅重置 failed → pending，保留 done
+    if args.retry_failed:
+        r = coll_list.update_many(
+            {"detail_status": "failed"},
+            {"$set": {"detail_status": "pending"},
+             "$unset": {"detail_started_at": "",
+                        "detail_processed_at": "",
+                        "detail_error": ""}},
+        )
+        logger.info(f"--retry-failed: 重置 {r.modified_count} 条 failed → pending")
+
+    # 启动恢复孤儿
+    rescued = rescue_orphaned_processing(coll_list)
+    if rescued:
+        logger.info(f"恢复 {rescued} 条卡在 processing 的孤儿")
+
+    # 构造 query
+    query: dict = {"detail_status": "pending"}
+    if args.keyword:
+        query["keyword"] = args.keyword
+
+    total_done = 0
+    total_failed = 0
+    total_processed = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(CDP_URL)
+        if not browser.contexts:
+            raise RuntimeError("CDP Chrome has no open contexts; start Chrome first")
+        ctx = browser.contexts[0]
+
+        batch_idx = 0
+        while True:
+            # 分批取
+            cursor = coll_list.find(query).sort("_id").limit(args.batch)
+            batch = []
+            for doc in cursor:
+                if args.limit and (total_processed + len(batch)) >= args.limit:
+                    break
+                if args.dry_run:
+                    # Dry-run: 不抢占 status，保留 pending 计数供后续 verification
+                    batch.append(doc)
+                else:
+                    claimed = claim_one(coll_list, doc["_id"])
+                    if claimed:
+                        batch.append(claimed)
+
+            if not batch:
+                logger.info("没有更多 pending 记录，退出")
+                break
+
+            batch_idx += 1
+            t0 = time.time()
+            logger.info(f"[batch {batch_idx}] 拿到 {len(batch)} 条，开始处理")
+            done, failed = await run_batch(ctx, batch, coll_list, coll_detail,
+                                           args.concurrency, args.dry_run)
+            elapsed = time.time() - t0
+            total_done += done
+            total_failed += failed
+            total_processed += len(batch)
+
+            # 进度日志
+            log_line = f"[batch {batch_idx}] done={done} failed={failed} elapsed={elapsed:.1f}s"
+            logger.info(log_line)
+            (HTML_DIR / "_progress.log").open("a", encoding="utf-8").write(
+                log_line + "\n"
+            )
+
+            if args.limit and total_processed >= args.limit:
+                logger.info(f"达到 --limit={args.limit}，停止")
+                break
+
+            time.sleep(args.pace)
+
+    logger.info(
+        f"完成。done={total_done} failed={total_failed} "
+        f"total={total_processed}"
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
