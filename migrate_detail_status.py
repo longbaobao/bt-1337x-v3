@@ -9,7 +9,9 @@ from pymongo import MongoClient
 sys.path.insert(0, ".")
 try:
     from crawl_1337x import DB_NAME, MONGO_URI
-except ModuleNotFoundError:
+except ModuleNotFoundError as exc:
+    if exc.name != "crawl_1337x":
+        raise
     # 当前单关键词爬虫已重命名为 crawl_1337x_by_key.py。
     from crawl_1337x_by_key import DB_NAME, MONGO_URI
 
