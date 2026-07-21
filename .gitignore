@@ -5,3 +5,4 @@ __pycache__/
 data/html/*.html
 data/html/_progress.log
 !data/html/.gitkeep
+.claude/worktrees/
