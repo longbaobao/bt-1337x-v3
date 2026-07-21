@@ -77,3 +77,54 @@ def extract_imdb_id(imdb_url: str | None) -> str | None:
         return None
     m = re.search(r"(tt\d+)", imdb_url)
     return m.group(1) if m else None
+
+
+# ============================================================
+# DB 层（Task 5）
+# ============================================================
+from pymongo import ReturnDocument
+
+
+def claim_one(coll_list, doc_id: str) -> dict | None:
+    """CAS: 把 pending 的 doc 抢占为 processing。返回 claimed 文档；被抢走返回 None。"""
+    claimed = coll_list.find_one_and_update(
+        {"_id": doc_id, "detail_status": "pending"},
+        {"$set": {"detail_status": "processing", "detail_started_at": now_str()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return claimed
+
+
+def mark_done(coll_list, doc_id: str) -> None:
+    """成功完成 → done。"""
+    coll_list.update_one(
+        {"_id": doc_id},
+        {"$set": {"detail_status": "done", "detail_processed_at": now_str()},
+         "$unset": {"detail_started_at": "", "detail_error": ""}},
+    )
+
+
+def mark_failed(coll_list, doc_id: str, error_msg: str) -> None:
+    """失败 → failed。保留 error 信息供排查。"""
+    coll_list.update_one(
+        {"_id": doc_id},
+        {"$set": {"detail_status": "failed",
+                  "detail_processed_at": now_str(),
+                  "detail_error": error_msg},
+         "$unset": {"detail_started_at": ""}},
+    )
+
+
+def upsert_detail(coll_detail, doc: dict) -> None:
+    """覆盖或插入详情文档。"""
+    coll_detail.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+
+
+def rescue_orphaned_processing(coll_list) -> int:
+    """启动时恢复：卡在 processing 的孤儿 → pending。返回恢复数量。"""
+    r = coll_list.update_many(
+        {"detail_status": "processing"},
+        {"$set": {"detail_status": "pending"},
+         "$unset": {"detail_started_at": ""}},
+    )
+    return r.modified_count
