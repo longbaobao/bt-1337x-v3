@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/html/*.html
+data/html/_progress.log
+!data/html/.gitkeep
