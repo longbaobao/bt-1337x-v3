@@ -11,6 +11,7 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 CDP_URL = "http://127.0.0.1:9222"
 MONGO_URI = "mongodb://localhost:27017/"
@@ -262,3 +263,24 @@ def parse_detail(html: str, detail_url: str) -> dict:
         "c_time": now_str(),
         "source": "1337x",
     }
+
+
+# ============================================================
+# 浏览器层（Task 6）
+# ============================================================
+
+
+async def fetch_one(page, url: str) -> str:
+    """访问详情页并返回 HTML 字符串。超时抛 PWTimeout。"""
+    await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    await page.wait_for_selector(
+        "div.torrent-detail, div.box-info-heading", timeout=30000
+    )
+    return await page.content()
+
+
+def save_html_cache(detail_url: str, html: str) -> None:
+    """写本地 HTML 缓存。HTML_DIR 不存在则建。"""
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
+    path = html_cache_path(detail_url)
+    path.write_text(html, encoding="utf-8")
