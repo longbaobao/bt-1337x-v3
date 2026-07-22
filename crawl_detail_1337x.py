@@ -408,8 +408,23 @@ async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, d
 
     每个 task 用 asyncio.wait_for 包 run_one，强制 60s 总预算。
     超时 → mark_failed + 返回 "failed"（并跳过 DB 写）。
+
+    浏览器死亡快检：批开始前先试一次 new_page，失败则整批跳过，
+    避免 100 条 doc 全部走完 100 次 new_page 失败才意识到浏览器死了。
     """
     sem = asyncio.Semaphore(concurrency)
+
+    # 浏览器健康检查：试开一页立即关掉
+    try:
+        health_page = await ctx.new_page()
+        await health_page.close()
+    except Exception as e:
+        err = f"browser dead, batch aborted: {type(e).__name__}: {e}"
+        logger.error(f"浏览器已不可用，整批 {len(docs)} 条跳过：{e}")
+        if not dry_run:
+            for doc in docs:
+                mark_failed(coll_list, doc["_id"], err)
+        return 0, len(docs)
 
     async def one(doc):
         async with sem:
