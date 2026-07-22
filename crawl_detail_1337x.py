@@ -14,20 +14,13 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
 
 # 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-try:
-    from crawl_1337x import CDP_URL, MONGO_URI, DB_NAME, COLL_LIST, COLL_DETAIL
-except ModuleNotFoundError as exc:
-    if exc.name != "crawl_1337x":
-        raise
-    # 当前单关键词爬虫已重命名为 crawl_1337x_by_key.py；
-    # 它只导出 3 个共享常量（CDP_URL/MONGO_URI/DB_NAME），COLL_LIST/COLL_DETAIL 是 detail crawler 专用，保持本地
-    from crawl_1337x_by_key import CDP_URL, MONGO_URI, DB_NAME
-    COLL_LIST = "bt_info_list"
-    COLL_DETAIL = "bt_info_detail"
+from crawl_1337x_by_key import CDP_URL, MONGO_URI, DB_NAME
+COLL_LIST = "bt_info_list"
+COLL_DETAIL = "bt_info_detail"
 
 HTML_DIR = Path("data/html")
 
-BATCH = 200
+BATCH = 100
 MAX_RETRIES = 3
 RETRY_BACKOFF = (2, 4, 8)  # 秒
 RUN_ONE_BUDGET = 60  # 秒
@@ -334,14 +327,18 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
     short_id = doc_id[:8]
     last_err = None
 
+    name = doc.get("name", "")
+    logger.info(f"[{short_id}] 开始处理：{name}")
+
     # 缓存命中分支：直接读 HTML，跳过 fetch + retry
     cache_path = html_cache_path(url)
     if cache_path.exists():
+        logger.info(f"[{short_id}] 缓存命中，跳过下载：{cache_path.name}")
         try:
             html = cache_path.read_text(encoding="utf-8")
         except OSError as e:
             last_err = f"CacheReadError: {e}"
-            logger.error(f"[{short_id}] cache read failed: {e}")
+            logger.error(f"[{short_id}] 读取缓存失败：{e}")
             if not dry_run:
                 mark_failed(coll_list, doc_id, last_err)
             return "failed"
@@ -349,47 +346,58 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
             parsed = parse_detail(html, url)
         except ParseError as e:
             last_err = f"ParseError: {e}"
-            logger.error(f"[{short_id}] parse failed (cached): {e}")
+            logger.error(f"[{short_id}] 解析失败（缓存）：{e}")
             if not dry_run:
                 mark_failed(coll_list, doc_id, last_err)
             return "failed"
         if not dry_run:
             upsert_detail(coll_detail, parsed)
             mark_done(coll_list, doc_id)
+        logger.info(f"[{short_id}] 处理完成（缓存命中）→ done | title={parsed.get('title', '')!r}")
         await asyncio.sleep(INTER_REQUEST_SLEEP)
         return "done"
 
     # 缓存未命中：retry loop
+    logger.info(f"[{short_id}] 缓存未命中，开始下载：{url}")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            logger.info(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次尝试：fetch_one")
             html = await fetch_one(page, url)
+            logger.info(f"[{short_id}] 下载完成，HTML {len(html)} 字节，保存到缓存")
             save_html_cache(url, html)
+            logger.info(f"[{short_id}] 开始解析详情页")
             parsed = parse_detail(html, url)
+            logger.info(f"[{short_id}] 解析完成：title={parsed.get('title', '')!r}")
             if not dry_run:
                 upsert_detail(coll_detail, parsed)
+                logger.info(f"[{short_id}] 已写入 bt_info_detail")
                 mark_done(coll_list, doc_id)
+                logger.info(f"[{short_id}] 状态已更新 → done")
+            else:
+                logger.info(f"[{short_id}] dry-run 模式，跳过 DB 写入")
             await asyncio.sleep(INTER_REQUEST_SLEEP)
             return "done"
         except PWTimeout as e:
             last_err = f"PWTimeout: {e}"
-            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} timeout")
+            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次超时：{e}")
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
         except PWError as e:
             last_err = f"PlaywrightError: {e}"
-            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} browser err")
+            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次浏览器错误：{e}")
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
         except ParseError as e:
             last_err = f"ParseError: {e}"
-            logger.error(f"[{short_id}] parse failed: {e}")
+            logger.error(f"[{short_id}] 解析失败（不可重试）：{e}")
             break
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            logger.warning(f"[{short_id}] attempt {attempt}/{MAX_RETRIES} unknown: {last_err}")
+            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次未知错误：{last_err}")
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
 
+    logger.error(f"[{short_id}] 重试耗尽，标记 failed：{last_err}")
     if not dry_run:
         mark_failed(coll_list, doc_id, last_err or "unknown")
     return "failed"
@@ -405,7 +413,15 @@ async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, d
 
     async def one(doc):
         async with sem:
-            page = await ctx.new_page()
+            try:
+                page = await ctx.new_page()
+            except Exception as e:
+                # 浏览器上下文已关闭 / new_page 失败 —— 单条 doc 标 failed
+                err = f"new_page failed: {type(e).__name__}: {e}"
+                logger.error(f"[{doc['_id'][:8]}] {err}（浏览器可能已关闭）")
+                if not dry_run:
+                    mark_failed(coll_list, doc["_id"], err)
+                return "failed"
             try:
                 return await asyncio.wait_for(
                     run_one(page, doc, coll_list, coll_detail, dry_run=dry_run),
@@ -415,18 +431,28 @@ async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, d
                 if not dry_run:
                     mark_failed(coll_list, doc["_id"], f"run_one exceeded {RUN_ONE_BUDGET}s budget")
                 return "failed"
+            except Exception as e:
+                # run_one 内部已有 try/except，但外层兜底（page 状态异常等）
+                err = f"{type(e).__name__}: {e}"
+                logger.error(f"[{doc['_id'][:8]}] run_one 抛出未捕获异常：{err}")
+                if not dry_run:
+                    mark_failed(coll_list, doc["_id"], err)
+                return "failed"
             finally:
-                await page.close()
+                try:
+                    await page.close()
+                except Exception:
+                    pass  # page 可能已 dead，忽略关闭错误
 
     results = await asyncio.gather(*[one(d) for d in docs], return_exceptions=True)
     done = sum(1 for r in results if r == "done")
     failed = sum(1 for r in results if r == "failed")
     exceptions = sum(1 for r in results if isinstance(r, Exception))
     if exceptions:
-        logger.error(f"  {exceptions} tasks raised exceptions")
+        logger.error(f"  {exceptions} 个 task 抛出未捕获异常")
         for r in results:
             if isinstance(r, Exception):
-                logger.error(f"  exc: {type(r).__name__}: {r}")
+                logger.error(f"  异常详情：{type(r).__name__}: {r}")
     return done, failed
 
 
