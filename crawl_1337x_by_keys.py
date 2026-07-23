@@ -6,22 +6,19 @@
 已 done 的 key 自动跳过,失败的 key 不写 done(下次重试可捡起)。
 
 并发模型:
-    -c 1         串行,沿用现有 9222 Chrome(向后兼容,零侵入)
-    -c N>1       自动启 N 个 Chrome 在 9222..9221+N(独立 user-data-dir)
+    -c N   ThreadPoolExecutor(N) 调 N 个 worker subprocess,每个 worker
+           由 DrissionPage 自启独立 headless Chrome(独立 user-data-dir,
+           独立端口),wrapper 不再管 Chrome 生命周期。
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 import argparse
-import atexit
 import concurrent.futures
 import logging
 import os
-import signal
-import socket
 import subprocess
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 logging.basicConfig(
@@ -31,14 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_ROOT = Path.home() / ".chrome_debug_profile"
 KEYS_FILE = Path("data/keys.txt")
 DONE_FILE = Path("data/keys-done.txt")
 SCRIPT = "crawl_1337x_by_key.py"
-CDP_BASE_PORT = 9222
-CDP_URL_PREFIX = "http://127.0.0.1:"
-CDP_READY_TIMEOUT = 30  # 秒
 WORKER_TIMEOUT = 600    # 单 key 上限
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
@@ -94,45 +86,6 @@ def load_done() -> set[str]:
     }
 
 
-def port_in_use(port: int) -> bool:
-    """探测端口是否已被占用(其他 Chrome / 服务)。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
-def wait_cdp_ready(port: int, timeout: int = CDP_READY_TIMEOUT) -> bool:
-    """等 CDP /json/version 可访问,超时返回 False。"""
-    url = f"{CDP_URL_PREFIX}{port}/json/version"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            urllib.request.urlopen(url, timeout=1).read()
-            return True
-        except Exception:
-            time.sleep(0.5)
-    return False
-
-
-def start_chrome(port: int) -> subprocess.Popen:
-    """启一个独立 Chrome 实例,返回 Popen。"""
-    user_data = USER_DATA_ROOT / f"pool_{port}"
-    user_data.mkdir(parents=True, exist_ok=True)
-    args = [
-        CHROME_EXE,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={user_data}",
-        "--headless=new",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-    logger.info(f"启动 Chrome: port={port}, profile={user_data}")
-    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # 不弹黑窗
-    return subprocess.Popen(args, **kwargs)
-
-
 def append_done(key: str, lock: threading.Lock) -> None:
     """线程安全地追加一行到 done.txt 并 flush。"""
     with lock:
@@ -141,16 +94,14 @@ def append_done(key: str, lock: threading.Lock) -> None:
             f.flush()
 
 
-def run_one(key: str, cdp_url: str) -> tuple[str, int, str]:
+def run_one(key: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key,返回 (key, returncode, stderr_tail)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
-
-    cdp_url 保留形参以兼容 caller,但不再传给子脚本 —— DrissionPage
-    在每个子脚本内自启 headless Chrome,不接管 wrapper 启的实例。
+    Chrome 由 DrissionPage 在子脚本内自启 headless 实例,wrapper 不管 Chrome 生命周期。
     """
     args = [sys.executable, SCRIPT, key]
-    logger.info(f"[开始] {key} pid={os.getpid()} (DrissionPage 自启 Chrome;wrapper cdp_url={cdp_url} 仅日志参考)")
+    logger.info(f"[开始] {key} pid={os.getpid()} (DrissionPage 子脚本内自启 Chrome)")
     try:
         # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
         # stdout 不 capture,实时看到子脚本进度;stderr 截留,失败时 dump
@@ -177,7 +128,7 @@ def main() -> int:
         "-c", "--concurrency", type=int, default=resolve_concurrency(), choices=range(MIN_CONCURRENCY, MAX_CONCURRENCY + 1), metavar="N",
         help=(
             f"并发 worker 数(范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],默认读环境变量"
-            f" {ENV_CONCURRENCY}={DEFAULT_CONCURRENCY};>1 时 wrapper 自动启 N 个 Chrome)"
+            f" {ENV_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 自启独立 Chrome)"
         ),
     )
     args = parser.parse_args()
@@ -197,64 +148,6 @@ def main() -> int:
         logger.info("无新 key 待处理,退出")
         return 0
 
-    chrome_procs: list[subprocess.Popen] = []
-    cdp_urls: list[str] = []
-
-    def cleanup_chrome() -> None:
-        for p in chrome_procs:
-            if p.poll() is None:
-                logger.info(f"关闭 Chrome pid={p.pid}")
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-
-    atexit.register(cleanup_chrome)
-
-    def _signal_handler(signum, _frame):
-        cleanup_chrome()
-        sys.exit(128 + signum)
-
-    try:
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-    except (ValueError, AttributeError):
-        # Windows 下 signal 在子线程里注册会 ValueError,主线程 OK,这里兜底
-        pass
-
-    if concurrency == 1:
-        cdp_urls = [f"{CDP_URL_PREFIX}{CDP_BASE_PORT}"]
-        logger.info(f"并发数=1,沿用现有 Chrome {CDP_BASE_PORT} 端口")
-    else:
-        ports = list(range(CDP_BASE_PORT, CDP_BASE_PORT + concurrency))
-        for port in ports:
-            if port_in_use(port):
-                logger.error(
-                    f"端口 {port} 已被占用,并发模式需独占 {ports[0]}..{ports[-1]}。"
-                    f"请先关闭占用的 Chrome 实例,或减小 -c 参数"
-                )
-                cleanup_chrome()
-                return 1
-        for port in ports:
-            chrome_procs.append(start_chrome(port))
-            cdp_urls.append(f"{CDP_URL_PREFIX}{port}")
-        # 等所有 CDP 就绪
-        ready_ok = True
-        for port, proc in zip(ports, chrome_procs):
-            if proc.poll() is not None:
-                logger.error(f"Chrome 端口 {port} 启动后立即退出,退出码={proc.returncode}")
-                ready_ok = False
-                break
-            if not wait_cdp_ready(port):
-                logger.error(f"Chrome 端口 {port} CDP 未在 {CDP_READY_TIMEOUT}s 内就绪")
-                ready_ok = False
-                break
-            logger.info(f"Chrome 端口 {port} CDP 就绪")
-        if not ready_ok:
-            cleanup_chrome()
-            return 1
-
     done_lock = threading.Lock()
     failed: list[tuple[str, str]] = []
     started_at = time.time()
@@ -262,10 +155,9 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {}
         worker_started: dict[concurrent.futures.Future, float] = {}
-        for i, key in enumerate(pending):
-            cdp_url = cdp_urls[i % concurrency]
-            logger.info(f"[入队] {key} cdp_url={cdp_url}")
-            fut = pool.submit(run_one, key, cdp_url)
+        for key in pending:
+            logger.info(f"[入队] {key}")
+            fut = pool.submit(run_one, key)
             futures[fut] = key
             worker_started[fut] = time.time()
         for fut in concurrent.futures.as_completed(futures):
