@@ -1,20 +1,27 @@
 """
 1337x 详情页爬虫：从 bt_info_list 取 detail_url，抓 HTML 落本地，解析入库。
 
-连接本地 9222 调试端口的 Chrome（不新开进程），复用现有 context。
+DrissionPage 自启 headless Chrome（auto_port 强制独立进程），不接管外部 9222 实例。
+- 并发模型：ThreadPoolExecutor(max_workers=concurrency)，每个 worker 一个独立 tab
+- 单 tab timeout 走 future.result(timeout=RUN_ONE_BUDGET)
+- 浏览器死亡快检：批开始前先 new_tab() 一次，失败则整批跳过
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 import re
 import calendar
 import hashlib
+import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+from threading import Semaphore
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
+from DrissionPage import ChromiumPage, ChromiumOptions
+from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
 # 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-from crawl_1337x_by_key import CDP_URL, MONGO_URI, DB_NAME
+from crawl_1337x_by_key import MONGO_URI, DB_NAME
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
 
@@ -272,13 +279,12 @@ def parse_detail(html: str, detail_url: str) -> dict:
 # ============================================================
 
 
-async def fetch_one(page, url: str) -> str:
-    """访问详情页并返回 HTML 字符串。超时抛 PWTimeout。"""
-    await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-    await page.wait_for_selector(
-        "div.torrent-detail, div.box-info-heading", timeout=30000
-    )
-    return await page.content()
+def fetch_one(tab, url: str) -> str:
+    """访问详情页并返回 HTML 字符串。超时抛 ElementNotFoundError。"""
+    tab.get(url, timeout=30)
+    tab.wait.load_start()
+    tab.ele("div.torrent-detail, div.box-info-heading", timeout=30)
+    return tab.html
 
 
 def save_html_cache(detail_url: str, html: str) -> None:
@@ -291,7 +297,6 @@ def save_html_cache(detail_url: str, html: str) -> None:
 # ============================================================
 # 编排层（Task 7）
 # ============================================================
-import asyncio
 import argparse
 import time
 import logging
@@ -304,7 +309,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
+def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
     """处理单条 URL → 持久化一条记录。返回 'done' 或 'failed'。
 
     单 URL 顺序：
@@ -313,12 +318,12 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
         → parse_detail
         → upsert_detail（非 dry_run）
         → mark_done（非 dry_run）
-        → asyncio.sleep(INTER_REQUEST_SLEEP)
+        → time.sleep(INTER_REQUEST_SLEEP)
         → 下一条
 
     缓存命中：直接读 HTML，跳过 fetch + retry。
     缓存未命中：retry loop 内 fetch + cache save + parse + save。
-    - PWTimeout / PWError → 重试 MAX_RETRIES 次（间或用 RETRY_BACKOFF）
+    - ElementNotFoundError / PageDisconnectedError → 重试 MAX_RETRIES 次（间或用 RETRY_BACKOFF）
     - ParseError → 不重试，直接 failed
     - 其他异常 → 重试 MAX_RETRIES 次
     """
@@ -354,7 +359,7 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
             upsert_detail(coll_detail, parsed)
             mark_done(coll_list, doc_id)
         logger.info(f"[{short_id}] 处理完成（缓存命中）→ done | title={parsed.get('title', '')!r}")
-        await asyncio.sleep(INTER_REQUEST_SLEEP)
+        _time.sleep(INTER_REQUEST_SLEEP)
         return "done"
 
     # 缓存未命中：retry loop
@@ -362,7 +367,7 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次尝试：fetch_one")
-            html = await fetch_one(page, url)
+            html = fetch_one(tab, url)
             logger.info(f"[{short_id}] 下载完成，HTML {len(html)} 字节，保存到缓存")
             save_html_cache(url, html)
             logger.info(f"[{short_id}] 开始解析详情页")
@@ -375,18 +380,13 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
                 logger.info(f"[{short_id}] 状态已更新 → done")
             else:
                 logger.info(f"[{short_id}] dry-run 模式，跳过 DB 写入")
-            await asyncio.sleep(INTER_REQUEST_SLEEP)
+            _time.sleep(INTER_REQUEST_SLEEP)
             return "done"
-        except PWTimeout as e:
-            last_err = f"PWTimeout: {e}"
-            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次超时：{e}")
+        except (ElementNotFoundError, PageDisconnectedError) as e:
+            last_err = f"DrissionError: {type(e).__name__}: {e}"
+            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次浏览器错误：{last_err}")
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
-        except PWError as e:
-            last_err = f"PlaywrightError: {e}"
-            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次浏览器错误：{e}")
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
+                _time.sleep(RETRY_BACKOFF[attempt - 1])
         except ParseError as e:
             last_err = f"ParseError: {e}"
             logger.error(f"[{short_id}] 解析失败（不可重试）：{e}")
@@ -395,7 +395,7 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
             last_err = f"{type(e).__name__}: {e}"
             logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次未知错误：{last_err}")
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_BACKOFF[attempt - 1])
+                _time.sleep(RETRY_BACKOFF[attempt - 1])
 
     logger.error(f"[{short_id}] 重试耗尽，标记 failed：{last_err}")
     if not dry_run:
@@ -403,21 +403,21 @@ async def run_one(page, doc: dict, coll_list, coll_detail, dry_run: bool = False
     return "failed"
 
 
-async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, dry_run: bool) -> tuple[int, int]:
-    """开 N 个 page 并行跑一批 docs，返回 (done, failed)。
+def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurrency: int, dry_run: bool) -> tuple[int, int]:
+    """开 N 个 tab 并行跑一批 docs，返回 (done, failed)。
 
-    每个 task 用 asyncio.wait_for 包 run_one，强制 60s 总预算。
+    每个 task 用 future.result(timeout=RUN_ONE_BUDGET) 包 run_one，强制 60s 总预算。
     超时 → mark_failed + 返回 "failed"（并跳过 DB 写）。
 
-    浏览器死亡快检：批开始前先试一次 new_page，失败则整批跳过，
-    避免 100 条 doc 全部走完 100 次 new_page 失败才意识到浏览器死了。
+    浏览器死亡快检：批开始前先试一次 new_tab，失败则整批跳过，
+    避免 100 条 doc 全部走完 100 次 new_tab 失败才意识到浏览器死了。
     """
-    sem = asyncio.Semaphore(concurrency)
+    sem = Semaphore(concurrency)
 
-    # 浏览器健康检查：试开一页立即关掉
+    # 浏览器健康检查：试开一 tab 立即关掉
     try:
-        health_page = await ctx.new_page()
-        await health_page.close()
+        health_tab = browser.new_tab()
+        health_tab.close()
     except Exception as e:
         err = f"browser dead, batch aborted: {type(e).__name__}: {e}"
         logger.error(f"浏览器已不可用，整批 {len(docs)} 条跳过：{e}")
@@ -426,28 +426,27 @@ async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, d
                 mark_failed(coll_list, doc["_id"], err)
         return 0, len(docs)
 
-    async def one(doc):
-        async with sem:
+    def one(doc):
+        with sem:
             try:
-                page = await ctx.new_page()
+                tab = browser.new_tab()
             except Exception as e:
-                # 浏览器上下文已关闭 / new_page 失败 —— 单条 doc 标 failed
-                err = f"new_page failed: {type(e).__name__}: {e}"
+                # 浏览器上下文已关闭 / new_tab 失败 —— 单条 doc 标 failed
+                err = f"new_tab failed: {type(e).__name__}: {e}"
                 logger.error(f"[{doc['_id'][:8]}] {err}（浏览器可能已关闭）")
                 if not dry_run:
                     mark_failed(coll_list, doc["_id"], err)
                 return "failed"
             try:
-                return await asyncio.wait_for(
-                    run_one(page, doc, coll_list, coll_detail, dry_run=dry_run),
-                    timeout=RUN_ONE_BUDGET,
-                )
-            except asyncio.TimeoutError:
+                with ThreadPoolExecutor(max_workers=1) as inner:
+                    fut = inner.submit(run_one, tab, doc, coll_list, coll_detail, dry_run=dry_run)
+                    return fut.result(timeout=RUN_ONE_BUDGET)
+            except FutTimeout:
                 if not dry_run:
                     mark_failed(coll_list, doc["_id"], f"run_one exceeded {RUN_ONE_BUDGET}s budget")
                 return "failed"
             except Exception as e:
-                # run_one 内部已有 try/except，但外层兜底（page 状态异常等）
+                # run_one 内部已有 try/except，但外层兜底（tab 状态异常等）
                 err = f"{type(e).__name__}: {e}"
                 logger.error(f"[{doc['_id'][:8]}] run_one 抛出未捕获异常：{err}")
                 if not dry_run:
@@ -455,19 +454,14 @@ async def run_batch(ctx, docs: list, coll_list, coll_detail, concurrency: int, d
                 return "failed"
             finally:
                 try:
-                    await page.close()
+                    tab.close()
                 except Exception:
-                    pass  # page 可能已 dead，忽略关闭错误
+                    pass  # tab 可能已 dead，忽略关闭错误
 
-    results = await asyncio.gather(*[one(d) for d in docs], return_exceptions=True)
+    with ThreadPoolExecutor(max_workers=concurrency) as outer:
+        results = list(outer.map(one, docs))
     done = sum(1 for r in results if r == "done")
     failed = sum(1 for r in results if r == "failed")
-    exceptions = sum(1 for r in results if isinstance(r, Exception))
-    if exceptions:
-        logger.error(f"  {exceptions} 个 task 抛出未捕获异常")
-        for r in results:
-            if isinstance(r, Exception):
-                logger.error(f"  异常详情：{type(r).__name__}: {r}")
     return done, failed
 
 
@@ -484,7 +478,7 @@ def parse_args():
     return p.parse_args()
 
 
-async def main() -> None:
+def main() -> None:
     args = parse_args()
     from pymongo import MongoClient
     client = MongoClient(MONGO_URI)
@@ -527,12 +521,13 @@ async def main() -> None:
     total_failed = 0
     total_processed = 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(CDP_URL)
-        if not browser.contexts:
-            raise RuntimeError("CDP Chrome has no open contexts; start Chrome first")
-        ctx = browser.contexts[0]
+    # DrissionPage 自启 headless Chrome（auto_port 强制独立进程）
+    # 一个 ChromiumPage 实例 = 一个 Chrome 进程；并发靠多 tab + ThreadPoolExecutor
+    options = ChromiumOptions().auto_port(True)
+    browser = ChromiumPage(options)
+    logger.info(f"DrissionPage 已启动独立 Chrome (address={options.address})")
 
+    try:
         batch_idx = 0
         while True:
             # 分批取
@@ -556,8 +551,8 @@ async def main() -> None:
             batch_idx += 1
             t0 = time.time()
             logger.info(f"[batch {batch_idx}] 拿到 {len(batch)} 条，开始处理")
-            done, failed = await run_batch(ctx, batch, coll_list, coll_detail,
-                                           args.concurrency, args.dry_run)
+            done, failed = run_batch(browser, batch, coll_list, coll_detail,
+                                     args.concurrency, args.dry_run)
             elapsed = time.time() - t0
             total_done += done
             total_failed += failed
@@ -575,6 +570,13 @@ async def main() -> None:
                 break
 
             time.sleep(args.pace)
+    finally:
+        # 关闭整个 Chrome（DrissionPage 拥有自己的 Chrome，必须 quit）
+        try:
+            browser.quit()
+            logger.info("DrissionPage Chrome 已关闭")
+        except Exception as e:
+            logger.warning(f"关闭 Chrome 时异常: {type(e).__name__}: {e}")
 
     logger.info(
         f"完成。done={total_done} failed={total_failed} "
@@ -583,4 +585,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -15,13 +15,13 @@ sys.stdout.reconfigure(encoding="utf-8")
 import logging
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
 
 # 让 import 找到项目根的 crawl_1337x_by_key
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from crawl_1337x_by_key import (
-    parse_listing, parse_1337x_time, CDP_URL, BASE,
+    parse_listing, parse_1337x_time, BASE,
 )
 
 logging.basicConfig(
@@ -41,23 +41,27 @@ def main():
     search_url = f"{BASE}/search/{KEYWORD}/1/"
     logger.info(f"=== 三方对照验证开始 keyword={KEYWORD!r} ===")
     logger.info(f"目标 URL: {search_url}")
-    logger.info(f"CDP URL: {cdp_url := CDP_URL}")
 
-    logger.info("正在通过 Playwright 连接 CDP 并加载列表页第 1 页")
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp_url)
-        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = ctx.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_selector("table.table-list", timeout=30000)
-        html = page.content()
+    # DrissionPage 自启 headless Chrome(auto_port 强制独立进程),
+    # 与 crawl_1337x_by_key.py 同一模式,不依赖外部 9222 实例。
+    logger.info("正在通过 DrissionPage 自启 Chrome 并加载列表页第 1 页")
+    options = ChromiumOptions().auto_port(True)
+    page = ChromiumPage(options)
+    try:
+        page.get(search_url)
+        page.wait.load_start()
+        page.ele("table.table-list", timeout=30)
+        html = page.html
         logger.info(f"页面已加载,HTML 长度 {len(html)} bytes,准备截图")
         HTML_OUT.parent.mkdir(parents=True, exist_ok=True)
         HTML_OUT.write_text(html, encoding="utf-8")
-        page.screenshot(path=str(SHOT_OUT), full_page=True)
-        page.close()
+        SHOT_OUT.parent.mkdir(parents=True, exist_ok=True)
+        # DrissionPage 截图 API: path=目录, name=文件名 (Playwright path=完整文件路径)
+        page.get_screenshot(path=str(SHOT_OUT.parent), name=str(SHOT_OUT.name), full_page=True)
         logger.info(f"HTML 已保存到 {HTML_OUT}")
         logger.info(f"截图已保存到 {SHOT_OUT}")
+    finally:
+        page.quit()
 
     soup = BeautifulSoup(html, "html.parser")
     rows_html = soup.select("table.table-list tbody tr")

@@ -1,7 +1,8 @@
 """从 bt_info_list 选取多个有差异的详情页，访问后保存到 tests/fixtures/。
 
-这是一次性采集脚本，依赖已经以 CDP 调试模式运行的 Chrome。采集后可根据
-页面中 IMDB、INFOHASH 和 magnet 字段的实际情况手工挑选 canonical fixtures。
+这是一次性采集脚本。DrissionPage 自启 headless Chrome(独立 user-data-dir)，
+不依赖外部 9222 实例。采集后可根据页面中 IMDB、INFOHASH 和 magnet 字段
+的实际情况手工挑选 canonical fixtures。
 """
 from __future__ import annotations
 
@@ -13,11 +14,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from playwright.sync_api import sync_playwright
+from DrissionPage import ChromiumPage, ChromiumOptions
 from pymongo import MongoClient
 
 from crawl_detail_1337x import (
-    CDP_URL,
     MONGO_URI,
     DB_NAME,
     COLL_LIST,
@@ -68,32 +68,31 @@ def main() -> None:
     if not targets:
         raise RuntimeError(f"{DB_NAME}.{COLL_LIST} 中没有可用 detail_url")
 
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(CDP_URL)
-        if not browser.contexts:
-            raise RuntimeError("CDP Chrome 没有可复用的 browser context")
-        ctx = browser.contexts[0]
-        page = ctx.new_page()
-        try:
-            for filename, doc in targets:
-                url = doc["detail_url"]
-                output = FIX_DIR / filename
-                print(f"抓取 {url} -> {filename}")
-                print(f"  cache key: {html_cache_path(url)}")
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_selector(
-                        "div.torrent-detail, div.box-info-heading, div.box-info",
-                        timeout=30000,
-                    )
-                    html = page.content()
-                except Exception as exc:
-                    print(f"  WARN: 页面加载失败，跳过: {exc}")
-                    continue
-                output.write_text(html, encoding="utf-8")
-                print(f"  保存 {len(html)} 字节 ({doc.get('name', '')})")
-        finally:
-            page.close()
+    # DrissionPage 自启 headless Chrome,与 crawl_1337x_by_key.py 共享同一模式。
+    # auto_port(True) 强制自启独立 Chrome(不 attach 用户 9222)。
+    options = ChromiumOptions().auto_port(True)
+    page = ChromiumPage(options)
+    try:
+        for filename, doc in targets:
+            url = doc["detail_url"]
+            output = FIX_DIR / filename
+            print(f"抓取 {url} -> {filename}")
+            print(f"  cache key: {html_cache_path(url)}")
+            try:
+                page.get(url)
+                page.wait.load_start()
+                page.ele(
+                    "div.torrent-detail, div.box-info-heading, div.box-info",
+                    timeout=30,
+                )
+                html = page.html
+            except Exception as exc:
+                print(f"  WARN: 页面加载失败，跳过: {exc}")
+                continue
+            output.write_text(html, encoding="utf-8")
+            print(f"  保存 {len(html)} 字节 ({doc.get('name', '')})")
+    finally:
+        page.quit()
 
 
 if __name__ == "__main__":
