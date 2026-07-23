@@ -36,6 +36,10 @@ MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "bt_13337x_spider_db"
 COLL_NAME = "bt_info_list"
 
+# 旧 Playwright 时代用的 CDP 端口常量,留作向后兼容(给 crawl_detail_1337x.py 复用),
+# 本脚本已不再使用(DrissionPage 用 auto_port 自启)。如果 detail crawler 也迁走,即可删除。
+CDP_URL = "http://127.0.0.1:9222"
+
 # 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
 # 不实际使用此值,仅在启动日志中 echo 以保持 API 一致
 ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
