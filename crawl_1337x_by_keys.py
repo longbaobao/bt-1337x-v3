@@ -145,9 +145,12 @@ def run_one(key: str, cdp_url: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key,返回 (key, returncode, stderr_tail)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
+
+    cdp_url 保留形参以兼容 caller,但不再传给子脚本 —— DrissionPage
+    在每个子脚本内自启 headless Chrome,不接管 wrapper 启的实例。
     """
-    args = [sys.executable, SCRIPT, key, "--cdp-url", cdp_url]
-    logger.info(f"[开始] {key} pid={os.getpid()} cdp_url={cdp_url}")
+    args = [sys.executable, SCRIPT, key]
+    logger.info(f"[开始] {key} pid={os.getpid()} (DrissionPage 自启 Chrome;wrapper cdp_url={cdp_url} 仅日志参考)")
     try:
         # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
         # stdout 不 capture,实时看到子脚本进度;stderr 截留,失败时 dump

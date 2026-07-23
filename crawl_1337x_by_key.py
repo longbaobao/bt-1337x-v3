@@ -1,8 +1,13 @@
 """
 1337x 搜索结果抓取：单个关键词全量翻页，落 MongoDB。
 
-连接指定 CDP URL 的 Chrome（不新开进程），复用现有 context。
-keyword 与 cdp_url 通过命令行参数传入，方便被 crawl_1337x_by_keys.py 并发调用。
+DrissionPage 拉自己的 Chrome,每个子脚本独立管理浏览器生命周期。
+keyword 通过命令行参数传入，方便被 crawl_1337x_by_keys.py 并发调用。
+
+注意:DrissionPage 4.1.1.4 在 Windows 上 headless 模式有 bug
+(`--headless` 和 `--headless=new` 均触发 PageDisconnectedError / 404),
+目前只能以非 headless 模式运行,会弹出 Chrome 窗口。
+TODO:升级到支持 headless 的 DrissionPage 版本后再切回 headless。
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
@@ -15,7 +20,7 @@ import logging
 from datetime import datetime
 from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
 
@@ -26,7 +31,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CDP_URL = "http://127.0.0.1:9222"
 BASE = "https://1337x.to"
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "bt_13337x_spider_db"
@@ -142,24 +146,32 @@ def parse_listing(html: str, keyword: str) -> list[dict]:
     return items
 
 
-def load_page_with_retry(page, url: str, page_num: int, retries: int = 3) -> str | None:
-    """带重试地加载页面，超出重试次数返回 None（让上层跳过）。"""
+def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str | None:
+    """带重试地加载页面，超出重试次数返回 None（让上层跳过）。
+
+    DrissionPage API(传入的 tab 实际就是 ChromiumPage,本身即一个 tab):
+      tab.get(url)               — 导航
+      tab.wait.load_start()      — 等同 Playwright wait_until="domcontentloaded"
+      tab.ele(sel, timeout=N)    — 等同 Playwright wait_for_selector(sel, timeout=N*1000)
+      tab.html                   — 等同 page.content()
+    """
     for attempt in range(1, retries + 1):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_selector("table.table-list", timeout=30000)
-            return page.content()
-        except (PWTimeout, Exception) as e:
+            tab.get(url)
+            tab.wait.load_start()
+            tab.ele("table.table-list", timeout=30)
+            return tab.html
+        except Exception as e:
             logger.warning(f"第 {page_num} 页第 {attempt}/{retries} 次加载失败: {type(e).__name__}")
             if attempt < retries:
                 time.sleep(2 * attempt)  # 退避
     return None
 
 
-def main(keyword: str, cdp_url: str = CDP_URL):
+def main(keyword: str):
     search_url = f"{BASE}/search/{keyword}/{{page}}/"
     env_val = os.environ.get(ENV_CONCURRENCY, "").strip()
-    logger.info(f"=== 开始抓取 keyword={keyword!r} cdp_url={cdp_url} ===")
+    logger.info(f"=== 开始抓取 keyword={keyword!r} ===")
     if env_val:
         logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本脚本单 key 单进程,仅记录)")
     started_at = time.time()
@@ -168,12 +180,15 @@ def main(keyword: str, cdp_url: str = CDP_URL):
     coll = client[DB_NAME][COLL_NAME]
     logger.info(f"MongoDB 已连接: {MONGO_URI}{DB_NAME}.{COLL_NAME}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp_url)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.new_page()
-        logger.info(f"Playwright 已连接 CDP 并创建新页面")
+    # DrissionPage 自拉 Chrome,完全独立,不接管外部 Chrome
+    # ChromiumPage 本身即一个 tab,可直接当 tab 用,无需 new_tab()
+    # auto_port(True) 强制自启独立 Chrome(不 attach 用户 9222)
+    # NOTE: headless 模式在 Windows 上有 bug,暂用非 headless(弹窗)
+    options = ChromiumOptions().auto_port(True)
+    page = ChromiumPage(options)
+    logger.info(f"DrissionPage 已启动独立 Chrome (address={options.address})")
 
+    try:
         # 先打开第 1 页，探测总页数
         first_html = load_page_with_retry(page, search_url.format(page=1), 1)
         if first_html is None:
@@ -213,8 +228,13 @@ def main(keyword: str, cdp_url: str = CDP_URL):
             f"=== 完成 keyword={keyword} 耗时 {elapsed:.1f}s "
             f"库内 {DB_NAME}.{COLL_NAME} 中该 keyword 共 {total} 条 ==="
         )
-        page.close()
-        logger.info("Playwright 页面已关闭")
+    finally:
+        # 关闭整个 Chrome(DrissionPage 拥有自己的 Chrome,必须 quit)
+        try:
+            page.quit()
+            logger.info("DrissionPage Chrome 已关闭")
+        except Exception as e:
+            logger.warning(f"关闭 Chrome 时异常: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
@@ -225,10 +245,5 @@ if __name__ == "__main__":
         "keyword",
         help="搜索关键词（会作为 MongoDB 文档 keyword 字段值）",
     )
-    parser.add_argument(
-        "--cdp-url",
-        default=CDP_URL,
-        help=f"Chrome DevTools Protocol URL（默认 {CDP_URL}）",
-    )
     args = parser.parse_args()
-    main(keyword=args.keyword, cdp_url=args.cdp_url)
+    main(keyword=args.keyword)
