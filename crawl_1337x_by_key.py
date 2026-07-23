@@ -158,18 +158,93 @@ def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str 
       tab.wait.load_start()      — 等同 Playwright wait_until="domcontentloaded"
       tab.ele(sel, timeout=N)    — 等同 Playwright wait_for_selector(sel, timeout=N*1000)
       tab.html                   — 等同 page.content()
+
+    Cloudflare 5秒盾由 fetch_with_cf_bypass 内置处理 (见下), 无需手动 retry。
     """
-    for attempt in range(1, retries + 1):
+    try:
+        return fetch_with_cf_bypass(tab, url, "table.table-list", max_wait=45)
+    except Exception as e:
+        logger.warning(f"第 {page_num} 页加载失败: {type(e).__name__}: {str(e)[:80]}")
+        return None
+
+
+# Cloudflare 5秒盾特征字符串（CDN 在中国镜像成中文 "请稍候…"）
+_CF_CHALLENGE_MARKERS = (
+    "请稍候",
+    "Just a moment",
+    "cf_chl_opt",
+    "challenge-form",
+    "Checking your browser",
+)
+
+
+def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45) -> str:
+    """访问 URL, 自动处理 Cloudflare 5秒盾, 轮询直到目标元素出现或超时。
+
+    策略:
+      1. tab.get(url) 触发导航
+      2. wait.load_start 等 DOMContentLoaded
+      3. 检查 HTML 是否含 Cloudflare 挑战页特征 (5秒盾)
+         - 是: 等 5s 后重 fetch (challenge JS 通常 5s 后自动 redirect)
+      4. 检查目标元素是否出现
+         - 否: 等 3s 后重 fetch (页面可能还在加载)
+      5. 出现 → 返回 html
+      6. max_wait 秒后仍未达成 → 抛 TimeoutError
+
+    ⚠️ HEADLESS 限制: Cloudflare bot 检测对 headless Chrome 极度激进, 会持续返回
+    盾页 (即使每次 fetch 都等 5s), 此 helper 无法绕过。要爬 1337x 必须用
+    visible Chrome 模式 (不传 --headless), 或预热 Chrome profile 注入 cf_clearance
+    cookie 后再 headless。详见 crawl_1337x_by_key.py 顶部 docstring。
+
+    Raises: TimeoutError (目标元素未出现) / 原始 DrissionPage 异常。
+    """
+    from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
+
+    deadline = time.time() + max_wait
+    attempts = 0
+    last_stage = "init"
+    while time.time() < deadline:
+        attempts += 1
         try:
             tab.get(url)
             tab.wait.load_start()
-            tab.ele("table.table-list", timeout=30)
-            return tab.html
+            html = tab.html
+            # 检测 Cloudflare 5秒盾中间页
+            if any(m in html for m in _CF_CHALLENGE_MARKERS):
+                last_stage = "cf_shield"
+                logger.info(
+                    f"  fetch 第 {attempts} 次: 遇 Cloudflare 5秒盾,等 5s 后重试"
+                )
+                time.sleep(5)
+                continue
+            # 检测目标元素
+            try:
+                tab.ele(target_selector, timeout=8)
+                last_stage = "ok"
+                return html
+            except ElementNotFoundError:
+                last_stage = "no_target"
+                logger.info(
+                    f"  fetch 第 {attempts} 次: 未找到 {target_selector},等 3s 后重试"
+                )
+                time.sleep(3)
+                continue
+        except PageDisconnectedError as e:
+            last_stage = "page_disconnected"
+            logger.warning(f"  fetch 第 {attempts} 次: 页面断开 {e}, 等 2s 后重试")
+            time.sleep(2)
+            continue
         except Exception as e:
-            logger.warning(f"第 {page_num} 页第 {attempt}/{retries} 次加载失败: {type(e).__name__}")
-            if attempt < retries:
-                time.sleep(2 * attempt)  # 退避
-    return None
+            last_stage = f"{type(e).__name__}"
+            logger.warning(
+                f"  fetch 第 {attempts} 次: {type(e).__name__}: {str(e)[:80]}, 等 3s 后重试"
+            )
+            time.sleep(3)
+            continue
+
+    raise TimeoutError(
+        f"fetch 等 {max_wait}s 仍未拿到 {target_selector} (尝试 {attempts} 次, 最后阶段: {last_stage})"
+    )
 
 
 def main(keyword: str):

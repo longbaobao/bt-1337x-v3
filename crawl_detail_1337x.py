@@ -21,7 +21,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
 # 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-from crawl_1337x_by_key import MONGO_URI, DB_NAME
+from crawl_1337x_by_key import MONGO_URI, DB_NAME, fetch_with_cf_bypass
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
 
@@ -280,11 +280,13 @@ def parse_detail(html: str, detail_url: str) -> dict:
 
 
 def fetch_one(tab, url: str) -> str:
-    """访问详情页并返回 HTML 字符串。超时抛 ElementNotFoundError。"""
-    tab.get(url, timeout=30)
-    tab.wait.load_start()
-    tab.ele("div.torrent-detail, div.box-info-heading", timeout=30)
-    return tab.html
+    """访问详情页并返回 HTML 字符串。Cloudflare 5秒盾由 fetch_with_cf_bypass 自动等待。
+
+    Raises: TimeoutError (目标元素始终未出现) / 原始 DrissionPage 异常。
+    """
+    return fetch_with_cf_bypass(
+        tab, url, "div.torrent-detail, div.box-info-heading", max_wait=45
+    )
 
 
 def save_html_cache(detail_url: str, html: str) -> None:
