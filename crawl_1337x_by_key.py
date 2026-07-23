@@ -4,10 +4,10 @@
 DrissionPage 拉自己的 Chrome,每个子脚本独立管理浏览器生命周期。
 keyword 通过命令行参数传入，方便被 crawl_1337x_by_keys.py 并发调用。
 
-注意:DrissionPage 4.1.1.4 在 Windows 上 headless 模式有 bug
-(`--headless` 和 `--headless=new` 均触发 PageDisconnectedError / 404),
-目前只能以非 headless 模式运行,会弹出 Chrome 窗口。
-TODO:升级到支持 headless 的 DrissionPage 版本后再切回 headless。
+Headless 模式：DrissionPage 4.1.1.4 的 .headless(True) 在 Windows 上有 bug
+(传 --headless=new,Chrome 不监听 ws endpoint,DrissionPage 连不上报 404)。
+变通方案:用 set_argument('--headless')(老式 flag),Chrome 会监听 ws,能正常
+启 headless 无窗口。.set_headless() 旧 API 在 4.1.1.4 不存在。
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
@@ -187,10 +187,12 @@ def main(keyword: str):
     # DrissionPage 自拉 Chrome,完全独立,不接管外部 Chrome
     # ChromiumPage 本身即一个 tab,可直接当 tab 用,无需 new_tab()
     # auto_port(True) 强制自启独立 Chrome(不 attach 用户 9222)
-    # NOTE: headless 模式在 Windows 上有 bug,暂用非 headless(弹窗)
-    options = ChromiumOptions().auto_port(True)
+    # set_argument('--headless') 用老式 flag (不是 --headless=new),
+    # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
+    # 实现真 headless 无窗口运行。
+    options = ChromiumOptions().set_argument("--headless").auto_port(True)
     page = ChromiumPage(options)
-    logger.info(f"DrissionPage 已启动独立 Chrome (address={options.address})")
+    logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
     try:
         # 先打开第 1 页，探测总页数

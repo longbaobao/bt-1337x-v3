@@ -523,9 +523,12 @@ def main() -> None:
 
     # DrissionPage 自启 headless Chrome（auto_port 强制独立进程）
     # 一个 ChromiumPage 实例 = 一个 Chrome 进程；并发靠多 tab + ThreadPoolExecutor
-    options = ChromiumOptions().auto_port(True)
+    # set_argument('--headless') 用老式 flag (不是 --headless=new),
+    # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
+    # 实现真 headless 无窗口运行。详见 crawl_1337x_by_key.py 顶部 docstring。
+    options = ChromiumOptions().set_argument("--headless").auto_port(True)
     browser = ChromiumPage(options)
-    logger.info(f"DrissionPage 已启动独立 Chrome (address={options.address})")
+    logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
     try:
         batch_idx = 0
