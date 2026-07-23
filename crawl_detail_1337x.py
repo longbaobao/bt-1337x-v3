@@ -526,7 +526,9 @@ def main() -> None:
     # set_argument('--headless') 用老式 flag (不是 --headless=new),
     # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
     # 实现真 headless 无窗口运行。详见 crawl_1337x_by_key.py 顶部 docstring。
-    options = ChromiumOptions().set_argument("--headless").auto_port(True)
+    options = (ChromiumOptions()
+               # .set_argument("--headless")
+               .auto_port(True))
     browser = ChromiumPage(options)
     logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
