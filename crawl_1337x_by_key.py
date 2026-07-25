@@ -12,12 +12,14 @@ Headless 模式：DrissionPage 4.1.1.4 的 .headless(True) 在 Windows 上有 bu
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 import argparse
+import json
 import os
 import re
 import time
 import hashlib
 import logging
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin
 
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -46,6 +48,54 @@ ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
 
 # 单页之间间隔（秒），礼貌爬取
 PAGE_SLEEP = 1.0
+
+# 断点续爬 checkpoint 目录:每个 keyword 一个 JSON,记录已爬到的页码。
+# 子进程被 wrapper 超时 kill 后,重试可从中断页继续,而不是重头爬(避免大 key 永远超时无进展)。
+CHECKPOINT_DIR = Path("data/checkpoints")
+
+
+def _checkpoint_path(keyword: str) -> Path:
+    """keyword → checkpoint 文件路径。文件名做安全化 + md5 后缀防冲突/防非法字符。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", keyword)[:40]
+    h = hashlib.md5(keyword.encode()).hexdigest()[:8]
+    return CHECKPOINT_DIR / f"{safe}-{h}.json"
+
+
+def load_checkpoint(keyword: str) -> tuple[int, int]:
+    """读取 (done_page, last_page)。无 checkpoint 或读取失败返回 (0, 0)。"""
+    p = _checkpoint_path(keyword)
+    if not p.exists():
+        return 0, 0
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return int(data.get("done_page", 0)), int(data.get("last_page", 0))
+    except Exception as e:
+        logger.warning(f"读取 checkpoint 失败({p.name}): {e}，当作无 checkpoint 从头开始")
+        return 0, 0
+
+
+def save_checkpoint(keyword: str, done_page: int, last_page: int) -> None:
+    """原子写 checkpoint(先写 .tmp 再 replace),防止子进程被 kill 时留下半截损坏文件。"""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    p = _checkpoint_path(keyword)
+    tmp = p.parent / (p.name + ".tmp")
+    payload = {
+        "keyword": keyword,
+        "done_page": done_page,
+        "last_page": last_page,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)  # 同盘原子替换
+
+
+def clear_checkpoint(keyword: str) -> None:
+    """全部爬完后删除 checkpoint。"""
+    p = _checkpoint_path(keyword)
+    try:
+        p.unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning(f"删除 checkpoint 失败({p.name}): {e}")
 
 # 1337x 时间格式: "Oct. 21st '22" / "2am Jul. 13th" / "Jul. 29th '24"
 MONTH_MAP = {
@@ -247,7 +297,8 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
     )
 
 
-def main(keyword: str):
+def main(keyword: str) -> int:
+    """抓取单个 keyword 全量翻页。返回退出码:0=全部爬完,非 0=失败(交给 wrapper 重试)。"""
     search_url = f"{BASE}/search/{keyword}/{{page}}/"
     env_val = os.environ.get(ENV_CONCURRENCY, "").strip()
     logger.info(f"=== 开始抓取 keyword={keyword!r} ===")
@@ -259,49 +310,62 @@ def main(keyword: str):
     coll = client[DB_NAME][COLL_NAME]
     logger.info(f"MongoDB 已连接: {MONGO_URI}{DB_NAME}.{COLL_NAME}")
 
+    # 断点续爬:读上次进度。done_page=已处理到的页,last_page=总页数。
+    done_page, last_page = load_checkpoint(keyword)
+    resuming = done_page > 0 and last_page > 0
+
     # DrissionPage 自拉 Chrome,完全独立,不接管外部 Chrome
     # ChromiumPage 本身即一个 tab,可直接当 tab 用,无需 new_tab()
     # auto_port(True) 强制自启独立 Chrome(不 attach 用户 9222)
     # set_argument('--headless') 用老式 flag (不是 --headless=new),
     # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
     # 实现真 headless 无窗口运行。
-    options = ChromiumOptions().set_argument("--headless").auto_port(True)
+    options = (ChromiumOptions()
+               # .set_argument("--headless")
+               .auto_port(True))
     page = ChromiumPage(options)
     logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
-    try:
-        # 先打开第 1 页，探测总页数
-        first_html = load_page_with_retry(page, search_url.format(page=1), 1)
-        if first_html is None:
-            logger.error("第 1 页加载失败，无法启动")
-            return
-        last_page = detect_last_page(first_html)
-        logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
-
-        # 第一页已加载，复用
-        items = parse_listing(first_html, keyword)
+    def _process(html: str, page_num: int) -> None:
+        items = parse_listing(html, keyword)
         new_count = 0
         for it in items:
             if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
                 new_count += 1
-        logger.info(f"[1/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
+        logger.info(f"[{page_num}/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
 
-        # 翻 2..N
-        for n in range(2, last_page + 1):
-            url = search_url.format(page=n)
-            html = load_page_with_retry(page, url, n)
-            if html is None:
-                logger.warning(f"第 {n} 页重试耗尽，跳过")
-                continue
+    try:
+        if resuming and done_page >= last_page:
+            logger.info(f"checkpoint 显示 {keyword} 已全部完成({done_page}/{last_page}),直接收尾")
+        else:
+            if resuming:
+                start_page = done_page + 1
+                logger.info(f"断点续爬 {keyword}: 已完成 {done_page}/{last_page} 页,从第 {start_page} 页继续")
+            else:
+                # 首次运行:打开第 1 页,探测总页数并处理
+                first_html = load_page_with_retry(page, search_url.format(page=1), 1)
+                if first_html is None:
+                    logger.error("第 1 页加载失败，无法启动")
+                    return 2
+                last_page = detect_last_page(first_html)
+                logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
+                _process(first_html, 1)
+                done_page = 1
+                save_checkpoint(keyword, done_page, last_page)
+                start_page = 2
 
-            items = parse_listing(html, keyword)
-            new_count = 0
-            for it in items:
-                if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
-                    new_count += 1
-            logger.info(f"[{n}/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
-            time.sleep(PAGE_SLEEP)
-            time.sleep(PAGE_SLEEP)
+            # 翻 start_page..N
+            for n in range(start_page, last_page + 1):
+                url = search_url.format(page=n)
+                html = load_page_with_retry(page, url, n)
+                if html is None:
+                    logger.warning(f"第 {n} 页重试耗尽，跳过(标记已处理,避免卡住进度)")
+                else:
+                    _process(html, n)
+                # 无论成功/跳过都推进 checkpoint,保证重试单调前进,不会永远卡在同一页
+                done_page = n
+                save_checkpoint(keyword, done_page, last_page)
+                time.sleep(PAGE_SLEEP)
 
         total = coll.count_documents({"keyword": keyword})
         elapsed = time.time() - started_at
@@ -309,6 +373,8 @@ def main(keyword: str):
             f"=== 完成 keyword={keyword} 耗时 {elapsed:.1f}s "
             f"库内 {DB_NAME}.{COLL_NAME} 中该 keyword 共 {total} 条 ==="
         )
+        clear_checkpoint(keyword)  # 全部爬完,清掉 checkpoint
+        return 0
     finally:
         # 关闭整个 Chrome(DrissionPage 拥有自己的 Chrome,必须 quit)
         try:
@@ -327,4 +393,4 @@ if __name__ == "__main__":
         help="搜索关键词（会作为 MongoDB 文档 keyword 字段值）",
     )
     args = parser.parse_args()
-    main(keyword=args.keyword)
+    sys.exit(main(keyword=args.keyword))

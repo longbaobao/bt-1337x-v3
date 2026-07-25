@@ -5,6 +5,10 @@
 成功的 key 追加到 data/keys-done.txt(线程锁保护)。
 已 done 的 key 自动跳过,失败的 key 不写 done(下次重试可捡起)。
 
+失败重试:一个 key 失败(含 600s 超时 rc=124)会自动重试,最多 MAX_ATTEMPTS 次。
+子脚本带断点续爬(data/checkpoints/),每次重试从上次中断页继续,不重头爬,
+所以像 50 页的大 key 也能靠多次重试(以及多次运行 wrapper)最终爬完。
+
 并发模型:
     -c N   ThreadPoolExecutor(N) 调 N 个 worker subprocess,每个 worker
            由 DrissionPage 自启独立 headless Chrome(独立 user-data-dir,
@@ -32,6 +36,11 @@ KEYS_FILE = Path("data/keys.txt")
 DONE_FILE = Path("data/keys-done.txt")
 SCRIPT = "crawl_1337x_by_key.py"
 WORKER_TIMEOUT = 600    # 单 key 上限
+
+# 失败重试:一个 key 失败(含超时 rc=124)最多再跑几次。
+# 子脚本带断点续爬,每次重试从上次中断页继续,不会重头爬(所以重试有实际进展)。
+MAX_ATTEMPTS = 4        # 1 次初始 + 最多 3 次重试
+RETRY_BACKOFF = 5       # 每次重试前等待秒数
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
 # 范围 [1, 16];CLI --concurrency 可临时覆盖
@@ -94,32 +103,53 @@ def append_done(key: str, lock: threading.Lock) -> None:
             f.flush()
 
 
-def run_one(key: str) -> tuple[str, int, str]:
-    """subprocess 跑单个 key,返回 (key, returncode, stderr_tail)。
+def run_one(key: str) -> tuple[str, int, str, int]:
+    """subprocess 跑单个 key,失败自动重试(最多 MAX_ATTEMPTS 次)。
+    返回 (key, returncode, stderr_tail, attempts)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
     Chrome 由 DrissionPage 在子脚本内自启 headless 实例,wrapper 不管 Chrome 生命周期。
+    子脚本带断点续爬:每次重试都新开独立 Chrome,但会从上次中断的页码继续,不会重头爬。
     """
     args = [sys.executable, SCRIPT, key]
-    logger.info(f"[开始] {key} pid={os.getpid()} (DrissionPage 子脚本内自启 Chrome)")
-    try:
-        # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
-        # stdout 不 capture,实时看到子脚本进度;stderr 截留,失败时 dump
-        proc = subprocess.run(
-            args,
-            stdout=None,           # 透传到父进程 stdout
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=WORKER_TIMEOUT,
+    rc, stderr_tail = 1, ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.info(
+            f"[开始] {key} 第 {attempt}/{MAX_ATTEMPTS} 次 pid={os.getpid()} "
+            f"(DrissionPage 子脚本内自启 Chrome,断点续爬)"
         )
-        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-10:])
-        return key, proc.returncode, stderr_tail
-    except subprocess.TimeoutExpired:
-        return key, 124, f"timeout after {WORKER_TIMEOUT}s"
-    except Exception as e:
-        return key, 1, f"wrapper exception: {type(e).__name__}: {e}"
+        try:
+            # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
+            # stdout 不 capture,实时看到子脚本进度;stderr 截留,失败时 dump
+            proc = subprocess.run(
+                args,
+                stdout=None,           # 透传到父进程 stdout
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=WORKER_TIMEOUT,
+            )
+            rc = proc.returncode
+            stderr_tail = "\n".join((proc.stderr or "").splitlines()[-10:])
+        except subprocess.TimeoutExpired:
+            rc, stderr_tail = 124, f"timeout after {WORKER_TIMEOUT}s"
+        except Exception as e:
+            rc, stderr_tail = 1, f"wrapper exception: {type(e).__name__}: {e}"
+
+        if rc == 0:
+            if attempt > 1:
+                logger.info(f"[重试成功] {key} 第 {attempt} 次尝试成功")
+            return key, 0, stderr_tail, attempt
+
+        if attempt < MAX_ATTEMPTS:
+            logger.warning(
+                f"[重试] {key} 第 {attempt} 次失败 rc={rc},"
+                f"断点已保存,{RETRY_BACKOFF}s 后从中断页续爬"
+            )
+            time.sleep(RETRY_BACKOFF)
+
+    return key, rc, stderr_tail, MAX_ATTEMPTS
 
 
 def main() -> int:
@@ -164,16 +194,19 @@ def main() -> int:
             key = futures[fut]
             worker_elapsed = time.time() - worker_started[fut]
             try:
-                _, rc, stderr_tail = fut.result()
+                _, rc, stderr_tail, attempts = fut.result()
             except Exception as e:
                 failed.append((key, f"future 异常: {type(e).__name__}: {e}"))
                 logger.error(f"[失败] {key} 耗时 {worker_elapsed:.1f}s 异常: {e}")
                 continue
             if rc == 0:
                 append_done(key, done_lock)
-                logger.info(f"[完成] {key} 耗时 {worker_elapsed:.1f}s → 已写入 done.txt")
+                logger.info(f"[完成] {key} 耗时 {worker_elapsed:.1f}s (尝试 {attempts} 次) → 已写入 done.txt")
             else:
-                logger.error(f"[失败] {key} 耗时 {worker_elapsed:.1f}s 退出码={rc}\n{stderr_tail}")
+                logger.error(
+                    f"[失败] {key} 耗时 {worker_elapsed:.1f}s 退出码={rc} "
+                    f"(已重试 {attempts} 次仍失败,不写 done.txt,断点已保留下次可续爬)\n{stderr_tail}"
+                )
                 failed.append((key, f"退出码={rc}"))
 
     elapsed = time.time() - started_at
