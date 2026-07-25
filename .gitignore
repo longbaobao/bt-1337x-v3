@@ -6,6 +6,7 @@ data/html/*.html
 data/html/*.parsed.txt
 data/html/_progress.log
 data/keys-done.txt
+data/checkpoints/
 !data/html/.gitkeep
 .claude/worktrees/
 .idea/
