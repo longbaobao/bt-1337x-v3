@@ -146,6 +146,16 @@ def detect_last_page(html: str) -> int:
     return max(nums) if nums else 1
 
 
+def has_result_rows(html: str) -> bool:
+    """页面是否含至少一行结果(table.table-list 里有 tbody tr)。
+
+    用于区分「正常有结果」与「Cloudflare 软墙/未渲染返回的空表格骨架」。
+    1337x 有结果时表格必有行;拿到 0 行几乎都是被挡或没加载完,不能当成爬完。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    return bool(soup.select("table.table-list tbody tr"))
+
+
 def parse_listing(html: str, keyword: str) -> list[dict]:
     """解析搜索结果表格的每一行。
 
@@ -210,9 +220,13 @@ def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str 
       tab.html                   — 等同 page.content()
 
     Cloudflare 5秒盾由 fetch_with_cf_bypass 内置处理 (见下), 无需手动 retry。
+
+    注意 target_selector 用 "table.table-list tbody tr"(要求至少一行结果),
+    而不是 "table.table-list"(只要表格骨架)。否则 CF 软墙/未渲染返回的空表格
+    会被当成"加载成功",导致 detect_last_page=1、解析 0 条、误判爬完写入 done。
     """
     try:
-        return fetch_with_cf_bypass(tab, url, "table.table-list", max_wait=45)
+        return fetch_with_cf_bypass(tab, url, "table.table-list tbody tr", max_wait=45)
     except Exception as e:
         logger.warning(f"第 {page_num} 页加载失败: {type(e).__name__}: {str(e)[:80]}")
         return None
@@ -347,6 +361,11 @@ def main(keyword: str) -> int:
                 if first_html is None:
                     logger.error("第 1 页加载失败，无法启动")
                     return 2
+                # 兜底:即使拿到 html,若无结果行(CF 软墙/未渲染的空表格),
+                # 判定失败,不清 checkpoint、不写 done,交给 wrapper 重试。
+                if not has_result_rows(first_html):
+                    logger.error("第 1 页无结果行(疑似被 Cloudflare 拦截或未加载完),判定失败,交给上层重试")
+                    return 3
                 last_page = detect_last_page(first_html)
                 logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
                 _process(first_html, 1)
