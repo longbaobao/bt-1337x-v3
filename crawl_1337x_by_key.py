@@ -240,7 +240,15 @@ def classify_cf_challenge(html: str) -> str:
 # 关键:tab.ele() 内部会触发 wait.doc_loaded()(chromium_base.py:454),
 # 等 Page.loadEventFired,但 CF 盾页面永远不发 → 等满 timeout 返回 None。
 # 所以必须用直接 CDP DOM.querySelectorAll 找 iframe,绕开 wait.doc_loaded。
-_TURNSTILE_BOX_FRACTION = (0.25, 0.5)  # 复选框在 iframe (左 25%, 中线 50%)
+#
+# 复选框实际位置:Turnstile widget 通常 300x65,checkbox 在最左 8% 垂直中线
+# (24x24 小方块,左边距 ~12px)。(0.25, 0.5) 偏右会点到 widget 文字区而不是 checkbox。
+# 多位置尝试兜底不同 iframe 尺寸(各 CF widget 大小略有差异)。
+_TURNSTILE_CLICK_POSITIONS = (
+    (0.08, 0.5),  # 主要:checkbox 实际位置(最左 8%)
+    (0.15, 0.5),  # 备选 1
+    (0.50, 0.5),  # 备选 2:iframe 中心
+)
 
 
 def _find_turnstile_iframe(tab):
@@ -376,13 +384,16 @@ def _cdp_click(tab, x: float, y: float, steps: int = 12, step_sleep: float = 0.0
 def _try_click_turnstile_checkbox(tab) -> bool:
     """真实模拟鼠标过 Turnstile 复选框。
 
-    返回 True = 已发点击事件(等下次循环 fetch 看是否过盾)。
-    返回 False = 连 iframe 都找不到(可能早期 shell 还没加载完)。
+    多位置尝试 + 每次点击后验证 Turnstile iframe 是否消失:
+      1. 找 iframe(失败就 sleep 1s 重试一次)
+      2. 依次试 3 个位置(主:0.08,0.5 / 备:0.15,0.5 / 末:0.5,0.5)
+         每个位置点击后 sleep 1.5s + 检查 iframe 是否还在
+         消失了 → 成功,返回 True
+      3. 全部失败 → 返回 False
     """
     # 1. 直接 CDP 找 iframe(绕开 tab.ele 的 wait.doc_loaded 阻塞)
     found = _find_turnstile_iframe(tab)
     if not found:
-        # 早期 shell: iframe src 还没注入,等 1s 让 JS 注入完再试一次
         logger.info("Turnstile iframe 还没注入,等 1s 重试...")
         time.sleep(1)
         found = _find_turnstile_iframe(tab)
@@ -391,14 +402,39 @@ def _try_click_turnstile_checkbox(tab) -> bool:
     object_id, (x1, y1, x2, y2) = found
     box_w = x2 - x1
     box_h = y2 - y1
-    # 复选框大致在 iframe (左 25%, 中线 50%) — 1337x 用的 Turnstile widget
-    click_x = x1 + box_w * _TURNSTILE_BOX_FRACTION[0]
-    click_y = y1 + box_h * _TURNSTILE_BOX_FRACTION[1]
     logger.info(
-        f"找到 Turnstile iframe ({box_w:.0f}x{box_h:.0f} @ {x1:.0f},{y1:.0f}),"
-        f"点击 ({click_x:.0f},{click_y:.0f})"
+        f"找到 Turnstile iframe ({box_w:.0f}x{box_h:.0f} @ {x1:.0f},{y1:.0f})"
     )
-    return _cdp_click(tab, click_x, click_y)
+
+    # 2. 依次尝试多个位置(checkbox 实际在 widget 最左 ~8%)
+    for frac_x, frac_y in _TURNSTILE_CLICK_POSITIONS:
+        click_x = x1 + box_w * frac_x
+        click_y = y1 + box_h * frac_y
+        logger.info(f"  尝试点击 ({click_x:.0f},{click_y:.0f}) frac=({frac_x},{frac_y})")
+        if not _cdp_click(tab, click_x, click_y):
+            logger.info("  _cdp_click 抛异常,试下一个位置")
+            continue
+        # 3. 验证:点击后 Turnstile iframe 应该消失(用户已被判人类)
+        time.sleep(1.5)
+        if not _turnstile_iframe_still_present(tab):
+            logger.info(f"  ✓ Turnstile iframe 已消失(frac=({frac_x},{frac_y}) 命中)")
+            return True
+        logger.info("  ✗ iframe 还在(位置没点中,试下一个)")
+
+    return False
+
+
+def _turnstile_iframe_still_present(tab) -> bool:
+    """检查 Turnstile iframe 是否还在 DOM(用于点击后验证)。"""
+    try:
+        r = tab._run_cdp(
+            "DOM.performSearch",
+            query='iframe[src*="challenges.cloudflare.com"]',
+            includeUserAgentShadowDOM=True,
+        )
+        return bool(r and r.get("resultCount", 0) > 0)
+    except Exception:
+        return True  # 异常保守按"还在"处理,避免假阳性
 
 # 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
 # 不实际使用此值,仅在启动日志中 echo 以保持 API 一致

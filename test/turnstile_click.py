@@ -88,17 +88,28 @@ def main():
     check('start_x = max(0, x - 200)' in click_src or 'x - 200' in click_src,
           "_cdp_click 鼠标轨迹从远处起步(避免 teleport,反 bot 检测)")
 
-    # 4. click 坐标用 _TURNSTILE_BOX_FRACTION 比例(0.25, 0.5)左中,不是固定 offset
-    check("_TURNSTILE_BOX_FRACTION" in src,
-          "_try_click_turnstile_checkbox 用 _TURNSTILE_BOX_FRACTION 算点击坐标")
-    constants_src = inspect.getsource(ck) if False else ""  # placeholder
-    # 验证 _TURNSTILE_BOX_FRACTION = (0.25, 0.5) 在源代码
+    # 4. click 坐标用 _TURNSTILE_CLICK_POSITIONS 多位置(checkbox 在最左 8%)
+    check("_TURNSTILE_CLICK_POSITIONS" in src,
+          "_try_click_turnstile_checkbox 用 _TURNSTILE_CLICK_POSITIONS 多位置尝试")
     full_src = open(inspect.getfile(ck), encoding="utf-8").read()
-    check("_TURNSTILE_BOX_FRACTION = (0.25, 0.5)" in full_src,
-          "_TURNSTILE_BOX_FRACTION = (0.25, 0.5) 左中位置")
+    check("(0.08, 0.5)" in full_src,
+          "_TURNSTILE_CLICK_POSITIONS 主位置 (0.08, 0.5) 最左 8% (checkbox 实际位置)")
+    check("(0.15, 0.5)" in full_src,
+          "_TURNSTILE_CLICK_POSITIONS 备位置 1 (0.15, 0.5)")
+    check("(0.50, 0.5)" in full_src,
+          "_TURNSTILE_CLICK_POSITIONS 备位置 2 (0.5, 0.5) 中心")
+    # 旧 _TURNSTILE_BOX_FRACTION (单一 0.25, 0.5) 已替换
+    check("_TURNSTILE_BOX_FRACTION = (0.25, 0.5)" not in full_src,
+          "旧 _TURNSTILE_BOX_FRACTION = (0.25, 0.5) 单位置 已替换")
+    # 多位置 + 验证逻辑
+    check("for frac_x, frac_y in _TURNSTILE_CLICK_POSITIONS" in src,
+          "_try_click_turnstile_checkbox 循环尝试每个位置")
+    check("_turnstile_iframe_still_present" in src,
+          "_try_click_turnstile_checkbox 点击后验证 iframe 是否消失(确认命中)")
+    check("iframe 已消失" in src,
+          "成功时日志说 'iframe 已消失'")
 
     # 5. 旧 _TURNSTILE_CLICK_OFFSETS 不再被使用(避免误导)
-    #    检查源码里 _TURNSTILE_CLICK_OFFSETS 不再出现(已删除)
     check("_TURNSTILE_CLICK_OFFSETS" not in full_src,
           "旧 _TURNSTILE_CLICK_OFFSETS 已删除")
 
