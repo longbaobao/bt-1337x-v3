@@ -405,7 +405,7 @@ def _try_click_turnstile_checkbox(tab) -> bool:
 ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
 
 # 单页之间间隔（秒），礼貌爬取
-PAGE_SLEEP = 1.0
+PAGE_SLEEP = 8.0
 
 # 子脚本内部重试:失败(超时/CF 拦截/未渲染等)自动再跑,Chrome 每次重新创建
 # (前次失败时的卡死 page 状态不应跨 attempt 保留)。
