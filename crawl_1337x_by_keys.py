@@ -124,12 +124,19 @@ def _chrome_instance_path(pid: int) -> Path:
 
 
 def register_chrome_instance(pid: int, port: int = 0,
+                             chrome_pid: int | None = None,
                              _started_at: float | None = None) -> None:
-    """注册一个 Chrome 子进程条目。_started_at 仅测试用。"""
+    """注册一个 Chrome 子进程条目。_started_at 仅测试用。
+
+    chrome_pid 是 DrissionPage 拉起的 Chrome 浏览器进程 ID(≠ wrapper 子进程 PID)。
+    Windows 上 psutil.Process(wrapper_pid).terminate() 只杀父进程,Chrome 子进程
+    成为孤儿继续运行 —— 所以 LRU 必须直接杀 chrome_pid 才能真正关掉浏览器窗口。
+    """
     CHROME_INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "pid": pid,
         "port": port,
+        "chrome_pid": chrome_pid,
         "started_at": _started_at if _started_at is not None else time.time(),
         "registered": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -186,49 +193,110 @@ def list_alive_chrome_instances() -> list[dict]:
     return alive
 
 
+def _kill_proc_tree(parent_pid: int) -> bool:
+    """杀 parent_pid + 它所有 children(递归)。Windows 上 parent.terminate()
+    不会自动杀 children(变成孤儿),必须显式遍历 children kill。
+
+    Returns True if parent was killed (or was already dead).
+    """
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return True  # 已死,算成功
+    # 1. 收集所有 descendants
+    try:
+        children = parent.children(recursive=True)
+    except (psutil.NoSuchProcess, Exception):
+        children = []
+    # 2. 先 terminate 所有 children(给它们时间优雅退出)
+    for child in children:
+        try:
+            child.terminate()
+        except (psutil.NoSuchProcess, Exception):
+            pass
+    # 3. 等 children(最多 3s)
+    if children:
+        gone, alive = psutil.wait_procs(children, timeout=3.0)
+        for c in alive:
+            try:
+                c.kill()
+            except (psutil.NoSuchProcess, Exception):
+                pass
+    # 4. 最后 terminate parent
+    try:
+        parent.terminate()
+        try:
+            parent.wait(timeout=CHROME_INSTANCE_KILL_TIMEOUT)
+        except psutil.TimeoutExpired:
+            logger.warning(f"PID={parent_pid} {CHROME_INSTANCE_KILL_TIMEOUT}s 内未退出,强 kill")
+            parent.kill()
+            try:
+                parent.wait(timeout=2.0)
+            except psutil.TimeoutExpired:
+                pass
+        return True
+    except psutil.NoSuchProcess:
+        return True
+    except Exception as e:
+        logger.warning(f"杀 PID={parent_pid} 失败: {type(e).__name__}: {e}")
+        return False
+
+
 def ensure_chrome_capacity(cap: int) -> bool:
     """若活跃 Chrome 数 >= cap,杀最老的(直到 < cap)。返回是否真杀了。
 
-    LRU 淘汰策略:按 started_at 升序遍历,terminate() 最早注册的 PID,
-    等其文件被 list_alive 过滤掉(进程死了),再判断要不要继续杀。
+    cap 语义:
+      cap > 0: 杀到活跃数 < cap(常见用法)
+      cap <= 0: 视为 "全部杀掉"(0 个允许)
+
+    杀法策略:
+      1. 如果条目有 chrome_pid,先 terminate Chrome 进程(直接关浏览器窗口)
+      2. 然后用 psutil 杀 parent 进程树(parent + 所有 children)
+         Windows 上单独 terminate parent 不会杀 children,会变孤儿
+      3. 等 list_alive 下一轮过滤掉(进程死了 → 文件被清理)
 
     跨进程边界场景:
-    - 用户手动开了多个 wrapper 同时跑 → 它们都会查这个共享目录
-    - 总数超过 cap 时,后来的 wrapper 会杀先来的进程(用户的预期)
+      - 用户手动开了多个 wrapper 同时跑 → 它们都会查这个共享目录
+      - 总数超过 cap 时,后来的 wrapper 会杀先来的进程(用户的预期)
     """
-    if cap <= 0:
-        return False
+    if cap < 0:
+        cap = 0  # 负数视为"全部杀掉"
+    target = cap
     killed = False
     while True:
         alive = list_alive_chrome_instances()
-        if len(alive) < cap:
+        # 当 alive < target 时已腾够位置;alive >= target 都要继续杀
+        # (cap=N 含义:最多允许 N 个,所以 >= N 就要杀到 < N)
+        if len(alive) < target:
             return killed
         oldest = alive[0]
-        pid = oldest["pid"]
-        try:
-            proc = psutil.Process(pid)
-            logger.warning(
-                f"Chrome 实例数 {len(alive)} >= cap {cap},"
-                f"LRU 杀掉最老 PID={pid} (started_at={oldest.get('started_at')})"
-            )
-            proc.terminate()
-            killed = True
-            # 等进程消失(最多 5s),list_alive 下一轮会过滤掉
+        sub_pid = oldest["pid"]
+        chrome_pid = oldest.get("chrome_pid")
+        logger.warning(
+            f"Chrome 实例数 {len(alive)} >= cap {target},"
+            f"LRU 杀掉最老 sub_pid={sub_pid} chrome_pid={chrome_pid} "
+            f"(started_at={oldest.get('started_at')})"
+        )
+        # 1. 直接杀 Chrome(若知道其 PID),绕过 psutil children 扫描的延迟
+        if chrome_pid:
             try:
-                proc.wait(timeout=CHROME_INSTANCE_KILL_TIMEOUT)
-            except psutil.TimeoutExpired:
-                logger.warning(f"PID={pid} 5s 内未退出,强行 kill")
-                proc.kill()
+                cproc = psutil.Process(chrome_pid)
+                cproc.terminate()
                 try:
-                    proc.wait(timeout=2.0)
+                    cproc.wait(timeout=2.0)
                 except psutil.TimeoutExpired:
-                    pass
-        except psutil.NoSuchProcess:
-            # 已死但文件还在 → list_alive 下一轮会过滤
-            pass
-        except Exception as e:
-            logger.warning(f"杀 PID={pid} 失败: {type(e).__name__}: {e}")
-            return killed
+                    cproc.kill()
+                    try:
+                        cproc.wait(timeout=1.0)
+                    except psutil.TimeoutExpired:
+                        pass
+            except psutil.NoSuchProcess:
+                pass
+            except Exception as e:
+                logger.debug(f"直接杀 Chrome pid={chrome_pid} 失败(继续走进程树杀法): {e}")
+        # 2. 进程树杀法(兜底,处理 Chrome 子进程散落到 grandchildren 等场景)
+        if _kill_proc_tree(sub_pid):
+            killed = True
 
 
 def run_one(key: str, max_chrome: int) -> tuple[str, int, str]:
@@ -264,11 +332,13 @@ def run_one(key: str, max_chrome: int) -> tuple[str, int, str]:
             encoding="utf-8",
             errors="replace",
         )
-        register_chrome_instance(proc.pid)
+        # 注意: 注册 chrome_pid 由子脚本内部完成(它知道 DrissionPage 拉的 Chrome 进程 ID),
+        # wrapper 这里不再重复注册,避免冲突。
         try:
             stderr_bytes, _ = proc.communicate(timeout=WORKER_TIMEOUT)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # 子进程超时:用进程树杀法(terminate 不杀子进程,Chrome 会成孤儿)
+            _kill_proc_tree(proc.pid)
             try:
                 proc.communicate(timeout=2.0)
             except Exception:
@@ -279,8 +349,9 @@ def run_one(key: str, max_chrome: int) -> tuple[str, int, str]:
     except Exception as e:
         return key, 1, f"wrapper exception: {type(e).__name__}: {e}"
     finally:
-        if proc is not None:
-            unregister_chrome_instance(proc.pid)
+        # 子脚本的 finally 已经 unregister 了它自己的条目
+        # (子脚本退出时会删 data/chrome_instances/<sub_pid>.json)
+        pass
 
 
 def main() -> int:
