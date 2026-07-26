@@ -8,6 +8,7 @@ data/html/_progress.log
 data/keys-done.txt
 data/checkpoints/
 data/cf_cookies.json
+data/chrome_instances/
 !data/html/.gitkeep
 .claude/worktrees/
 .idea/
