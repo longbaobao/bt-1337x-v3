@@ -49,6 +49,12 @@ ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
 # 单页之间间隔（秒），礼貌爬取
 PAGE_SLEEP = 1.0
 
+# 子脚本内部重试:失败(超时/CF 拦截/未渲染等)自动再跑,Chrome 每次重新创建
+# (前次失败时的卡死 page 状态不应跨 attempt 保留)。
+# 1 次初始 + 最多 3 次重试 = 最多 4 次尝试。
+MAX_ATTEMPTS = 4
+RETRY_BACKOFF = 5  # 每次尝试前 sleep 秒数
+
 # 断点续爬 checkpoint 目录:每个 keyword 一个 JSON,记录已爬到的页码。
 # 子进程被 wrapper 超时 kill 后,重试可从中断页继续,而不是重头爬(避免大 key 永远超时无进展)。
 CHECKPOINT_DIR = Path("data/checkpoints")
@@ -311,11 +317,82 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
     )
 
 
-def main(keyword: str) -> int:
-    """抓取单个 keyword 全量翻页。返回退出码:0=全部爬完,非 0=失败(交给 wrapper 重试)。"""
+def main(keyword: str, page, coll, started_at: float) -> int:
+    """抓取单个 keyword 全量翻页(单次尝试)。
+    Chrome 由调用方 run_with_retry 创建/关闭;本函数只负责翻页+checkpoint+落库。
+    返回 0=全部爬完,非 0=失败(交给外层重试)。
+    """
     search_url = f"{BASE}/search/{keyword}/{{page}}/"
+
+    # 断点续爬:读上次进度。done_page=已处理到的页,last_page=总页数。
+    done_page, last_page = load_checkpoint(keyword)
+    resuming = done_page > 0 and last_page > 0
+
+    def _process(html: str, page_num: int) -> None:
+        items = parse_listing(html, keyword)
+        new_count = 0
+        for it in items:
+            if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
+                new_count += 1
+        logger.info(f"[{page_num}/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
+
+    if resuming and done_page >= last_page:
+        logger.info(f"checkpoint 显示 {keyword} 已全部完成({done_page}/{last_page}),直接收尾")
+    else:
+        if resuming:
+            start_page = done_page + 1
+            logger.info(f"断点续爬 {keyword}: 已完成 {done_page}/{last_page} 页,从第 {start_page} 页继续")
+        else:
+            # 首次运行:打开第 1 页,探测总页数并处理
+            first_html = load_page_with_retry(page, search_url.format(page=1), 1)
+            if first_html is None:
+                logger.error("第 1 页加载失败，无法启动")
+                return 2
+            # 兜底:即使拿到 html,若无结果行(CF 软墙/未渲染的空表格),
+            # 判定失败,不清 checkpoint、不写 done,交给 wrapper 重试。
+            if not has_result_rows(first_html):
+                logger.error("第 1 页无结果行(疑似被 Cloudflare 拦截或未加载完),判定失败,交给上层重试")
+                return 3
+            last_page = detect_last_page(first_html)
+            logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
+            _process(first_html, 1)
+            done_page = 1
+            save_checkpoint(keyword, done_page, last_page)
+            start_page = 2
+
+        # 翻 start_page..N
+        for n in range(start_page, last_page + 1):
+            url = search_url.format(page=n)
+            html = load_page_with_retry(page, url, n)
+            if html is None:
+                logger.warning(f"第 {n} 页重试耗尽，跳过(标记已处理,避免卡住进度)")
+            else:
+                _process(html, n)
+            # 无论成功/跳过都推进 checkpoint,保证重试单调前进,不会永远卡在同一页
+            done_page = n
+            save_checkpoint(keyword, done_page, last_page)
+            time.sleep(PAGE_SLEEP)
+
+    total = coll.count_documents({"keyword": keyword})
+    elapsed = time.time() - started_at
+    logger.info(
+        f"=== 完成 keyword={keyword} 耗时 {elapsed:.1f}s "
+        f"库内 {DB_NAME}.{COLL_NAME} 中该 keyword 共 {total} 条 ==="
+    )
+    clear_checkpoint(keyword)  # 全部爬完,清掉 checkpoint
+    return 0
+
+
+def run_with_retry(keyword: str) -> int:
+    """共享一个 Chrome 实例,最多尝试 MAX_ATTEMPTS 次 main(keyword)。
+
+    关键设计:Chrome 只在第 1 次尝试前启动,失败后退出当前 Chrome、重启新的;
+    浏览器/CF cookie 状态不跨 attempts 保留(否则前次失败时的卡死状态可能带过来)。
+
+    返回 0=全部爬完,非 0=MAX_ATTEMPTS 次都失败。
+    """
     env_val = os.environ.get(ENV_CONCURRENCY, "").strip()
-    logger.info(f"=== 开始抓取 keyword={keyword!r} ===")
+    logger.info(f"=== 开始抓取 keyword={keyword!r} (最多 {MAX_ATTEMPTS} 次,每次自启 Chrome) ===")
     if env_val:
         logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本脚本单 key 单进程,仅记录)")
     started_at = time.time()
@@ -323,10 +400,6 @@ def main(keyword: str) -> int:
     client = MongoClient(MONGO_URI)
     coll = client[DB_NAME][COLL_NAME]
     logger.info(f"MongoDB 已连接: {MONGO_URI}{DB_NAME}.{COLL_NAME}")
-
-    # 断点续爬:读上次进度。done_page=已处理到的页,last_page=总页数。
-    done_page, last_page = load_checkpoint(keyword)
-    resuming = done_page > 0 and last_page > 0
 
     # DrissionPage 自拉 Chrome,完全独立,不接管外部 Chrome
     # ChromiumPage 本身即一个 tab,可直接当 tab 用,无需 new_tab()
@@ -337,70 +410,35 @@ def main(keyword: str) -> int:
     options = (ChromiumOptions()
                # .set_argument("--headless")
                .auto_port(True))
-    page = ChromiumPage(options)
-    logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
-    def _process(html: str, page_num: int) -> None:
-        items = parse_listing(html, keyword)
-        new_count = 0
-        for it in items:
-            if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
-                new_count += 1
-        logger.info(f"[{page_num}/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
-
-    try:
-        if resuming and done_page >= last_page:
-            logger.info(f"checkpoint 显示 {keyword} 已全部完成({done_page}/{last_page}),直接收尾")
-        else:
-            if resuming:
-                start_page = done_page + 1
-                logger.info(f"断点续爬 {keyword}: 已完成 {done_page}/{last_page} 页,从第 {start_page} 页继续")
-            else:
-                # 首次运行:打开第 1 页,探测总页数并处理
-                first_html = load_page_with_retry(page, search_url.format(page=1), 1)
-                if first_html is None:
-                    logger.error("第 1 页加载失败，无法启动")
-                    return 2
-                # 兜底:即使拿到 html,若无结果行(CF 软墙/未渲染的空表格),
-                # 判定失败,不清 checkpoint、不写 done,交给 wrapper 重试。
-                if not has_result_rows(first_html):
-                    logger.error("第 1 页无结果行(疑似被 Cloudflare 拦截或未加载完),判定失败,交给上层重试")
-                    return 3
-                last_page = detect_last_page(first_html)
-                logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
-                _process(first_html, 1)
-                done_page = 1
-                save_checkpoint(keyword, done_page, last_page)
-                start_page = 2
-
-            # 翻 start_page..N
-            for n in range(start_page, last_page + 1):
-                url = search_url.format(page=n)
-                html = load_page_with_retry(page, url, n)
-                if html is None:
-                    logger.warning(f"第 {n} 页重试耗尽，跳过(标记已处理,避免卡住进度)")
-                else:
-                    _process(html, n)
-                # 无论成功/跳过都推进 checkpoint,保证重试单调前进,不会永远卡在同一页
-                done_page = n
-                save_checkpoint(keyword, done_page, last_page)
-                time.sleep(PAGE_SLEEP)
-
-        total = coll.count_documents({"keyword": keyword})
-        elapsed = time.time() - started_at
-        logger.info(
-            f"=== 完成 keyword={keyword} 耗时 {elapsed:.1f}s "
-            f"库内 {DB_NAME}.{COLL_NAME} 中该 keyword 共 {total} 条 ==="
-        )
-        clear_checkpoint(keyword)  # 全部爬完,清掉 checkpoint
-        return 0
-    finally:
-        # 关闭整个 Chrome(DrissionPage 拥有自己的 Chrome,必须 quit)
+    rc = 1
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        page = None
         try:
-            page.quit()
-            logger.info("DrissionPage Chrome 已关闭")
+            page = ChromiumPage(options)
+            logger.info(f"[尝试 {attempt}/{MAX_ATTEMPTS}] Chrome 已启动 (address={options.address})")
+            rc = main(keyword, page, coll, started_at)
+            if rc == 0:
+                return 0
         except Exception as e:
-            logger.warning(f"关闭 Chrome 时异常: {type(e).__name__}: {e}")
+            logger.error(f"[尝试 {attempt}] 异常: {type(e).__name__}: {e}")
+            rc = 99
+        finally:
+            if page is not None:
+                try:
+                    page.quit()
+                    logger.info(f"[尝试 {attempt}] Chrome 已关闭")
+                except Exception as e:
+                    logger.warning(f"[尝试 {attempt}] 关闭 Chrome 异常: {type(e).__name__}: {e}")
+
+        if attempt < MAX_ATTEMPTS:
+            logger.warning(
+                f"[尝试 {attempt}] 失败 rc={rc},{RETRY_BACKOFF}s 后从中断页续爬"
+            )
+            time.sleep(RETRY_BACKOFF)
+
+    logger.error(f"=== 失败 keyword={keyword} {MAX_ATTEMPTS} 次尝试均失败 ===")
+    return rc
 
 
 if __name__ == "__main__":
@@ -412,4 +450,4 @@ if __name__ == "__main__":
         help="搜索关键词（会作为 MongoDB 文档 keyword 字段值）",
     )
     args = parser.parse_args()
-    sys.exit(main(keyword=args.keyword))
+    sys.exit(run_with_retry(args.keyword))
