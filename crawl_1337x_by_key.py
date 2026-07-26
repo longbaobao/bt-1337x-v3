@@ -232,63 +232,108 @@ def classify_cf_challenge(html: str) -> str:
     return "none"
 
 
-# Turnstile 复选框在沙箱跨域 iframe 里,DOM 访问被挡,只能从父页发鼠标事件
+# Turnstile 复选框在沙箱跨域 iframe 里,DOM 访问被挡,只能从父页发鼠标事件。
 # CF bot 检测看:
 #   - navigator.webdriver (用 STEALTH_INIT_JS 覆盖)
-#   - 鼠标移动轨迹是否自然 (用 actions.move_to 而不是 ele.click)
-#   - 点击位置是否"太正中" (多点几次不同 offset)
-# Turnstile 复选框大致在 iframe 左下角,所以偏移策略先右下角再扩大
-_TURNSTILE_CLICK_OFFSETS = (
-    (0, 0),       # 中心
-    (-15, 0),     # 偏左 — Turnstile 复选框大致在 iframe 左下角
-    (-15, -10),
-    (-20, -5),
-    (0, -15),
-)
+#   - 鼠标移动轨迹是否自然 (CDP Input.dispatchMouseEvent 多步 mousemove)
+#   - 点击位置是否"太正中" (偏左 25% 模拟真实用户点击 checkbox 位置)
+# 关键:tab.ele() 内部会触发 wait.doc_loaded()(chromium_base.py:454),
+# 等 Page.loadEventFired,但 CF 盾页面永远不发 → 等满 timeout 返回 None。
+# 所以必须用直接 CDP DOM.querySelectorAll 找 iframe,绕开 wait.doc_loaded。
+_TURNSTILE_BOX_FRACTION = (0.25, 0.5)  # 复选框在 iframe (左 25%, 中线 50%)
+
+
+def _find_turnstile_iframe(tab):
+    """直接 CDP 找 Turnstile iframe,返回 (objectId, content_box) 或 None。
+
+    content_box = (x1, y1, x2, y2) 浏览器视口坐标(content,非 border)。
+    """
+    try:
+        r = tab._run_cdp(
+            "DOM.querySelectorAll",
+            selector='iframe[src*="challenges.cloudflare.com"]',
+        )
+    except Exception as e:
+        logger.info(f"querySelectorAll 找 iframe 失败: {e}")
+        return None
+    if not r or not r.get("nodeIds"):
+        return None
+    for backend_node_id in r["nodeIds"]:
+        if backend_node_id == 0:
+            continue
+        try:
+            obj = tab._run_cdp("DOM.resolveNode", backendNodeId=backend_node_id)
+            object_id = obj["object"]["objectId"]
+            box = tab._run_cdp("DOM.getBoxModel", objectId=object_id)
+        except Exception:
+            continue
+        model = box.get("model", {})
+        content = model.get("content")
+        if not content or len(content) < 4:
+            continue
+        # content = [x1, y1, x2, y2, x3, y3, x4, y4](四边形)
+        x1, y1, x2, y2 = content[0], content[1], content[4], content[5]
+        return object_id, (x1, y1, x2, y2)
+    return None
+
+
+def _cdp_click(tab, x: float, y: float, steps: int = 6, step_sleep: float = 0.04):
+    """直接走 CDP Input.dispatchMouseEvent 发真实鼠标事件(isTrusted=true)。
+
+    steps 个 mousemove 中间点(step_sleep 秒间隔)→ mousedown → mouseup,
+    模拟真实用户的鼠标轨迹。CF Turnstile 接受 isTrusted=true 的事件。
+    """
+    try:
+        cur = tab._run_cdp("Input.dispatchMouseEvent",
+                            type="mouseMoved", x=x, y=y, button="none")
+        # cur 一般返回当前位置;如果浏览器已记录 cursor,新 mousemove 会接着走
+        for i in range(1, steps + 1):
+            tab._run_cdp("Input.dispatchMouseEvent",
+                          type="mouseMoved",
+                          x=x + (i * 0.5), y=y + (i * 0.5),  # 细微抖动
+                          button="none")
+            time.sleep(step_sleep)
+    except Exception as e:
+        logger.debug(f"mousemove 失败: {e}")
+    # mousedown + mouseup (clickCount=1)
+    try:
+        tab._run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                      x=x, y=y, button="left", buttons="left", clickCount=1)
+        time.sleep(0.05)
+        tab._run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                      x=x, y=y, button="left", clickCount=1)
+    except Exception as e:
+        logger.info(f"mousedown/up 失败: {e}")
+        return False
+    return True
 
 
 def _try_click_turnstile_checkbox(tab) -> bool:
-    """真实模拟鼠标: move_to iframe → click,多个 offset 兜底。
+    """真实模拟鼠标过 Turnstile 复选框。
 
     返回 True = 已发点击事件(等下次循环 fetch 看是否过盾)。
     返回 False = 连 iframe 都找不到(可能早期 shell 还没加载完)。
     """
-    try:
-        iframe = tab.ele("iframe[src*='challenges.cloudflare.com']", timeout=3)
-    except Exception as e:
-        logger.info(f"找 Turnstile iframe 失败: {e}")
-        return False
-    if not iframe:
-        # 早期 shell: cf-turnstile class 已有但 iframe src 还没注入,
-        # 等 1s 让 JS 注入完再试一次
+    # 1. 直接 CDP 找 iframe(绕开 tab.ele 的 wait.doc_loaded 阻塞)
+    found = _find_turnstile_iframe(tab)
+    if not found:
+        # 早期 shell: iframe src 还没注入,等 1s 让 JS 注入完再试一次
         logger.info("Turnstile iframe 还没注入,等 1s 重试...")
         time.sleep(1)
-        try:
-            iframe = tab.ele("iframe[src*='challenges.cloudflare.com']", timeout=3)
-        except Exception:
-            pass
-        if not iframe:
-            # 真没 iframe 就返回 False,外面按"shield"路径走(原 sleep 5s)
-            return False
-    logger.info(f"找到 Turnstile iframe (rect={iframe.rect.size if hasattr(iframe.rect, 'size') else '?'}),尝试真实点击")
-    # 主路径: page.actions.move_to + click — 生成真实 Input.dispatchMouseEvent 序列
-    # (mousemove 多个中间点 → mousedown → mouseup),CF bot 检测看不到 teleport
-    for ox, oy in _TURNSTILE_CLICK_OFFSETS:
-        try:
-            tab.actions.move_to(iframe, offset_x=ox, offset_y=oy, duration=0.3).click()
-            logger.info(f"  → 已发送真实鼠标点击 (offset={ox},{oy})")
-            return True
-        except Exception as e:
-            logger.info(f"  → 真实点击 (offset={ox},{oy}) 失败: {e}")
-            continue
-    # 兜底: 简单 iframe.click() (无 mousemove 轨迹,可能被 CF 拒)
-    try:
-        iframe.click()
-        logger.info("  → 已发送 iframe.click() (兜底,无移动轨迹)")
-        return True
-    except Exception as e:
-        logger.info(f"  → 兜底 iframe.click() 也失败: {e}")
+        found = _find_turnstile_iframe(tab)
+    if not found:
         return False
+    object_id, (x1, y1, x2, y2) = found
+    box_w = x2 - x1
+    box_h = y2 - y1
+    # 复选框大致在 iframe (左 25%, 中线 50%) — 1337x 用的 Turnstile widget
+    click_x = x1 + box_w * _TURNSTILE_BOX_FRACTION[0]
+    click_y = y1 + box_h * _TURNSTILE_BOX_FRACTION[1]
+    logger.info(
+        f"找到 Turnstile iframe ({box_w:.0f}x{box_h:.0f} @ {x1:.0f},{y1:.0f}),"
+        f"点击 ({click_x:.0f},{click_y:.0f})"
+    )
+    return _cdp_click(tab, click_x, click_y)
 
 # 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
 # 不实际使用此值,仅在启动日志中 echo 以保持 API 一致
