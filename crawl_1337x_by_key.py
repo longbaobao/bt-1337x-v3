@@ -360,6 +360,9 @@ class PageTimer:
 class _FetchStats:
     """fetch_with_cf_bypass 的观测计数器(class 属性,主循环读 last_attempts)。"""
     last_attempts: int = 0
+    # 子阶段耗时累加(tab.get / wait.load_start / tab.html / tab.ele)
+    # 每次 fetch 内部循环会 + 一次,main() 在 phase log 里打印最后一次的累计
+    fetch_subphases: dict[str, float] = {}
 
 
 def format_phase_log(
@@ -372,7 +375,10 @@ def format_phase_log(
     """格式化单页 phase log。
 
     示例输出:
-        [42/50] fetch=15.3s (cf=2x) parse=0.5s save=0.05s sleep=1.0s items=20 total=17.3s
+        [42/50] fetch=15.3s (cf=2x)[g=.5 l=14.0 h=.3 e=.5] parse=0.5s save=0.05s sleep=1.0s items=20 total=17.3s
+
+    fetch 后面可选的 [g=... l=... h=... e=...] 是 sub-phase 拆分
+    (get / load_start / html / ele),只看 fetch 总耗时看不出在等啥时看这个。
     """
     t = timer.to_dict()
     parts = [f"[{page_num}/{total_pages}]"]
@@ -382,9 +388,20 @@ def format_phase_log(
         if v is None:
             continue
         suffix = "s"
-        if phase == "fetch" and cf_attempts > 1:
-            suffix = f"s (cf={cf_attempts}x)"
-        parts.append(f"{key}={v:.2f}{suffix}")
+        sub_breakdown = ""
+        if phase == "fetch":
+            cf_suffix = f" (cf={cf_attempts}x)" if cf_attempts > 1 else f" (cf={cf_attempts})"
+            suffix = "s" + cf_suffix
+            subs = _FetchStats.fetch_subphases or {}
+            if subs:
+                # 只输出非零的 sub-phase,避免空泡
+                nonzero = {k: round(v, 2) for k, v in subs.items() if v > 0}
+                if nonzero:
+                    sub_breakdown = "[" + " ".join(
+                        f"{ {'tab.get':'g','tab.html':'h','tab.ele':'e'}[k] }={v}"
+                        for k, v in nonzero.items()
+                    ) + "]"
+        parts.append(f"{key}={v:.2f}{suffix}{sub_breakdown}")
     parts.append(f"items={items_found}")
     parts.append(f"total={timer.total_elapsed():.2f}s")
     return " ".join(parts)
@@ -544,9 +561,9 @@ def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str 
 
     DrissionPage API(传入的 tab 实际就是 ChromiumPage,本身即一个 tab):
       tab.get(url)               — 导航
-      tab.wait.load_start()      — 等同 Playwright wait_until="domcontentloaded"
       tab.ele(sel, timeout=N)    — 等同 Playwright wait_for_selector(sel, timeout=N*1000)
-      tab.html                   — 等同 page.content()
+      tab.html                   — 等同 page.content()(会触发 wait.doc_loaded 隐式等待,
+                                          谨慎使用;直接调 DOM.getOuterHTML 可绕过)
 
     Cloudflare 5秒盾由 fetch_with_cf_bypass 内置处理 (见下), 无需手动 retry。
 
@@ -571,16 +588,32 @@ _CF_CHALLENGE_MARKERS = (
 )
 
 
+def _get_outer_html(tab) -> str:
+    """直接通过 CDP 拿 outerHTML,跳过 DrissionPage 的 tab.html 隐式 wait.doc_loaded()
+    (那个默认等 30s 第三方脚本,完全没必要)。
+    若 _root_id 还没设(从未调过 tab.ele),先 DOM.getDocument + DOM.resolveNode 拿一次。
+    """
+    if getattr(tab, "_root_id", None) is None:
+        doc = tab._run_cdp("DOM.getDocument")
+        bid = doc["result"]["root"]["backendNodeId"]
+        tab._root_id = tab._run_cdp(
+            "DOM.resolveNode", backendNodeId=bid
+        )["result"]["object"]["objectId"]
+    return tab._run_cdp(
+        "DOM.getOuterHTML", objectId=tab._root_id
+    )["result"]["outerHTML"]
+
+
 def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45) -> str:
     """访问 URL, 自动处理 Cloudflare 5秒盾, 轮询直到目标元素出现或超时。
 
-    策略:
-      1. tab.get(url) 触发导航
-      2. wait.load_start 等 DOMContentLoaded
-      3. 检查 HTML 是否含 Cloudflare 挑战页特征 (5秒盾)
+    最优策略:数据加载完就不等。
+      1. tab.get(url) 触发导航(不等 page load 事件,会被第三方脚本拖 30s)
+      2. tab.ele(target_selector, timeout=8) 等**我们自己**要的元素,
+         内部按 ~10ms 轮询 DOM,找到立即返回(不依赖 page load 事件)
+      3. 直接调 DOM.getOuterHTML 拿 HTML(不走 tab.html 隐式 wait.doc_loaded)
+      4. 检测 HTML 是否含 Cloudflare 挑战页特征 (5秒盾)
          - 是: 等 5s 后重 fetch (challenge JS 通常 5s 后自动 redirect)
-      4. 检查目标元素是否出现
-         - 否: 等 3s 后重 fetch (页面可能还在加载)
       5. 出现 → 返回 html
       6. max_wait 秒后仍未达成 → 抛 TimeoutError
 
@@ -597,6 +630,9 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
     from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
     _FetchStats.last_attempts = 0
+    _FetchStats.fetch_subphases = {
+        "tab.get": 0.0, "tab.html": 0.0, "tab.ele": 0.0,
+    }
     deadline = time.time() + max_wait
     attempts = 0
     last_stage = "init"
@@ -604,14 +640,37 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
         attempts += 1
         _FetchStats.last_attempts = attempts  # 暴露给 main loop 做诊断
         try:
+            # ─── 最优策略:数据加载完就不等 ──────────────────────────
+            # 不等 Page.loadEventFired(可被第三方脚本拖 30s),
+            # 也不让 tab.html 触发 wait.doc_loaded()(同上)。
+            # 只等我们真正需要的元素 tab.ele(target_selector),它内部按 ~10ms
+            # 轮询 DOM,找到就立即返回。然后直接调 DOM.getOuterHTML 拿 HTML。
+            # 对 1337x 这种服务端渲染:tab.ele 几百 ms 就找到,
+            # 总 fetch 时间从 20s+ 降到 1-2s。
+
+            t0 = time.perf_counter()
             tab.get(url)
-            tab.wait.load_start()
-            html = tab.html
-            # 检测 Cloudflare 5秒盾中间页
+            _FetchStats.fetch_subphases["tab.get"] += time.perf_counter() - t0
+
+            # 先尝试等目标元素(只等我们要的,不等 page load event)
+            t0 = time.perf_counter()
+            selector_found = False
+            try:
+                tab.ele(target_selector, timeout=8)
+                selector_found = True
+            except ElementNotFoundError:
+                pass  # 可能是 CF 盾 / 真没加载完 → 走下面 HTML 检查
+            _FetchStats.fetch_subphases["tab.ele"] += time.perf_counter() - t0
+
+            # 不管 selector 找没找到,都拿 HTML(走直接 CDP 调,无 wait.doc_loaded)
+            t0 = time.perf_counter()
+            html = _get_outer_html(tab)
+            _FetchStats.fetch_subphases["tab.html"] += time.perf_counter() - t0
+
+            # 检测 Cloudflare 盾(可能在 selector 找到之前出现,但 HTML 拿到后就能判)
             if any(m in html for m in _CF_CHALLENGE_MARKERS):
                 kind = classify_cf_challenge(html)
                 if kind == "turnstile":
-                    # Turnstile 复选框:跨 iframe 自动点 checkbox
                     last_stage = "cf_turnstile"
                     clicked = _try_click_turnstile_checkbox(tab)
                     if clicked:
@@ -626,7 +685,6 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
                         time.sleep(5)
                     continue
                 elif kind == "hcaptcha":
-                    # 升级到 hCaptcha 图像题,无法自动过 → 快速失败让 wrapper 重试
                     last_stage = "cf_hcaptcha"
                     logger.error(
                         f"  fetch 第 {attempts} 次: CF 升级到 hCaptcha 图像题,自动无法过,"
@@ -641,21 +699,21 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
                     )
                     time.sleep(5)
                     continue
-            # 检测目标元素
-            try:
-                tab.ele(target_selector, timeout=8)
-                last_stage = "ok"
-                # 刚穿过 CF:把浏览器里新鲜的 .1337x.to cookie 写回 cf_cookies.json,
-                # 下次启动直接注入省一遍盾
-                maybe_refresh_cf_cookies(tab)
-                return html
-            except ElementNotFoundError:
+
+            if not selector_found:
+                # 不是 CF 盾但 selector 仍未出现 → 真没加载完 → 等 3s 重试
                 last_stage = "no_target"
                 logger.info(
                     f"  fetch 第 {attempts} 次: 未找到 {target_selector},等 3s 后重试"
                 )
                 time.sleep(3)
                 continue
+
+            last_stage = "ok"
+            # 刚穿过 CF:把浏览器里新鲜的 .1337x.to cookie 写回 cf_cookies.json,
+            # 下次启动直接注入省一遍盾
+            maybe_refresh_cf_cookies(tab)
+            return html
         except PageDisconnectedError as e:
             last_stage = "page_disconnected"
             logger.warning(f"  fetch 第 {attempts} 次: 页面断开 {e}, 等 2s 后重试")
@@ -825,6 +883,11 @@ def run_with_retry(keyword: str) -> int:
 
     page = ChromiumPage(options)
     logger.info(f"Chrome 已启动 (address={options.address})—— {MAX_ATTEMPTS} 次 attempt 共享此实例")
+
+    # 注:不再设 page_load timeout(原先砍到 5s 的逻辑已不需要)。
+    # fetch_with_cf_bypass 已不调 wait.load_start / 不让 tab.html 触发
+    # wait.doc_loaded,直接 tab.ele + DOM.getOuterHTML,完全绕过 page load
+    # 事件(防止第三方脚本拖延 30s)。
 
     # Chrome 实例 LRU 注册:让 wrapper 的 ensure_chrome_capacity 能正确杀掉
     # 本进程拉起的 Chrome(只杀 parent wrapper PID 会让 Chrome 成孤儿继续跑)
