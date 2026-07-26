@@ -1,7 +1,6 @@
 """测试 parse_detail：HTML → 结构化字典。"""
 import pytest
-import sys
-sys.path.insert(0, ".")
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 from crawl_detail_1337x import parse_detail, ParseError
 from conftest import fixture
 
