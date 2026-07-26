@@ -6,8 +6,8 @@
 已 done 的 key 自动跳过,失败的 key 不写 done(下次重试可捡起)。
 
 重试策略: 子脚本 crawl_1337x_by_key.py 内置 run_with_retry() 共享一个
-subprocess,内部最多尝试 MAX_ATTEMPTS 次(每次自启独立 Chrome,避免卡死
-page 状态污染),断点落盘到 data/checkpoints/。wrapper 这里只管并发调度
+subprocess + 共享同一 Chrome 实例,内部最多尝试 4 次(MAX_ATTEMPTS 在
+子脚本里定义),断点落盘到 data/checkpoints/。wrapper 这里只管并发调度
 + 单 key 硬性超时兜底(WORKER_TIMEOUT 秒,防止子进程失控)。
 失败重跑 wrapper 即可从中断页续爬,跨多次运行最终爬完大 key。
 
@@ -110,16 +110,16 @@ def append_done(key: str, lock: threading.Lock) -> None:
 def run_one(key: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key。返回 (key, returncode, stderr_tail)。
 
-    重试逻辑已在子脚本 crawl_1337x_by_key.py 内实现(共享 Chrome 自重启重试,
-    最多 MAX_ATTEMPTS 次)。wrapper 这里只负责:每个 keyword 启一个 subprocess,
-    用 WORKER_TIMEOUT 做硬性兜底(防止子进程失控卡死)。
+    重试逻辑已在子脚本 crawl_1337x_by_key.py 内实现(run_with_retry 共享同一
+    Chrome 实例,最多 4 次 attempt)。wrapper 这里只负责:每个 keyword 启一个
+    subprocess,用 WORKER_TIMEOUT 做硬性兜底(防止子进程失控卡死)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
     """
     args = [sys.executable, SCRIPT, key]
     logger.info(
         f"[开始] {key} pid={os.getpid()} "
-        f"(DrissionPage 子脚本内自启 Chrome + 子脚本内重试 {MAX_ATTEMPTS} 次)"
+        f"(DrissionPage 子脚本内自启 Chrome,重试策略在子脚本内)"
     )
     try:
         # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
