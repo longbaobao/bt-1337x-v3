@@ -42,6 +42,125 @@ COLL_NAME = "bt_info_list"
 # 本脚本已不再使用(DrissionPage 用 auto_port 自启)。如果 detail crawler 也迁走,即可删除。
 CDP_URL = "http://127.0.0.1:9222"
 
+# CF 复选框/图像题分流标记(纯字符串检测用,不看 DOM 元素)
+_TURNSTILE_IFRAME_MARKER = "challenges.cloudflare.com"  # Turnstile 复选框 iframe
+_HCAPTCHA_MARKERS = ("hcaptcha.com",)                   # hCaptcha 图像题
+
+# 用户手动过 CF 后导出的 cookie 文件(JSON list 格式,见 data/cf_cookies.json.example)
+CF_COOKIES_FILE = Path("data/cf_cookies.json")
+
+
+class CFChallengeEscalated(Exception):
+    """CF 验证升级到图像题(hCaptcha),无法自动过,应快速失败而非继续重试。"""
+    pass
+
+
+def load_cf_cookies() -> list[dict]:
+    """读 data/cf_cookies.json,返回合法 cookie 列表。
+
+    合法格式:[{"name": "cf_clearance", "value": "...", "domain": ".1337x.to", ...}, ...]
+    - 文件不存在 / JSON 损坏 / 顶层不是 list → 返回 []
+    - 缺 name 或 value 的条目 → 跳过
+    """
+    if not CF_COOKIES_FILE.exists():
+        return []
+    try:
+        data = json.loads(CF_COOKIES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"读 {CF_COOKIES_FILE} 失败: {type(e).__name__}: {e} — 跳过 cookie 预热")
+        return []
+    if not isinstance(data, list):
+        logger.warning(f"{CF_COOKIES_FILE} 顶层不是 list,跳过")
+        return []
+    out = []
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        if not c.get("name") or c.get("value") is None:
+            continue
+        out.append(c)
+    if not out and data:
+        logger.warning(f"{CF_COOKIES_FILE} 里 {len(data)} 条全是无效 cookie(缺 name/value)")
+    return out
+
+
+def inject_cf_cookies(page) -> bool:
+    """把 load_cf_cookies() 读到的 cookie 注入到当前 page。返回 True 表示注入了至少 1 条。"""
+    cookies = load_cf_cookies()
+    if not cookies:
+        return False
+    try:
+        page.set.cookies(cookies)
+        logger.info(f"已注入 {len(cookies)} 条 CF cookie(来自 {CF_COOKIES_FILE})")
+        return True
+    except Exception as e:
+        logger.warning(f"注入 CF cookie 失败: {type(e).__name__}: {e}")
+        return False
+
+
+def detect_turnstile(html: str) -> bool:
+    """页面是否含 Turnstile 复选框 iframe(可自动点)。"""
+    return _TURNSTILE_IFRAME_MARKER in html
+
+
+def detect_hcaptcha(html: str) -> bool:
+    """页面是否含 hCaptcha(图像题,无法自动过,应快速失败)。"""
+    return any(m in html for m in _HCAPTCHA_MARKERS)
+
+
+def classify_cf_challenge(html: str) -> str:
+    """CF 挑战分类: 'turnstile' | 'hcaptcha' | 'shield' | 'none'。"""
+    if detect_turnstile(html):
+        return "turnstile"
+    if detect_hcaptcha(html):
+        return "hcaptcha"
+    if any(m in html for m in _CF_CHALLENGE_MARKERS):  # type: ignore[name-defined]
+        return "shield"
+    return "none"
+
+
+# Turnstile 复选框 iframe 在沙箱里是 cross-origin,DrissionPage 的 .ele()
+# 默认跨 iframe 自动找 — 下列 selector 按"最容易命中"排序,逐个 fallback
+_TURNSTILE_CHECKBOX_SELECTORS = (
+    "input[type='checkbox']",
+    ".cb-lb",          # Turnstile 复选框容器
+    "#challenge-stage",  # 老版 challenge
+)
+
+
+def _try_click_turnstile_checkbox(tab) -> bool:
+    """跨 iframe 找 Turnstile 复选框并尝试点击。返回 True = 已点(等待后续验证)。"""
+    try:
+        # 给 iframe 加载留 1-2s
+        iframe = tab.ele("iframe[src*='challenges.cloudflare.com']", timeout=3)
+    except Exception as e:
+        logger.debug(f"找 Turnstile iframe 失败: {e}")
+        return False
+    if not iframe:
+        return False
+    # DrissionPage 的 ele() 默认跨 iframe 递归找 — 直接传 selector
+    for sel in _TURNSTILE_CHECKBOX_SELECTORS:
+        try:
+            cb = iframe.ele(sel, timeout=2)
+        except Exception:
+            cb = None
+        if cb:
+            try:
+                cb.click()
+                logger.info(f"已点击 Turnstile 复选框 (selector={sel})")
+                return True
+            except Exception as e:
+                logger.debug(f"点击 {sel} 失败: {e}")
+                continue
+    # 兜底:整个 iframe 任何可见元素点一下(有些 Turnstile 复选框是 div)
+    try:
+        iframe.click()
+        logger.info("已点击 Turnstile iframe 中心(兜底)")
+        return True
+    except Exception as e:
+        logger.debug(f"兜底点击 iframe 失败: {e}")
+        return False
+
 # 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
 # 不实际使用此值,仅在启动日志中 echo 以保持 API 一致
 ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
@@ -281,12 +400,38 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
             html = tab.html
             # 检测 Cloudflare 5秒盾中间页
             if any(m in html for m in _CF_CHALLENGE_MARKERS):
-                last_stage = "cf_shield"
-                logger.info(
-                    f"  fetch 第 {attempts} 次: 遇 Cloudflare 5秒盾,等 5s 后重试"
-                )
-                time.sleep(5)
-                continue
+                kind = classify_cf_challenge(html)
+                if kind == "turnstile":
+                    # Turnstile 复选框:跨 iframe 自动点 checkbox
+                    last_stage = "cf_turnstile"
+                    clicked = _try_click_turnstile_checkbox(tab)
+                    if clicked:
+                        logger.info(
+                            f"  fetch 第 {attempts} 次: Turnstile 复选框已自动点击,等 4s 后重试"
+                        )
+                        time.sleep(4)
+                    else:
+                        logger.info(
+                            f"  fetch 第 {attempts} 次: Turnstile iframe 找到但点不到,等 5s 后重试"
+                        )
+                        time.sleep(5)
+                    continue
+                elif kind == "hcaptcha":
+                    # 升级到 hCaptcha 图像题,无法自动过 → 快速失败让 wrapper 重试
+                    last_stage = "cf_hcaptcha"
+                    logger.error(
+                        f"  fetch 第 {attempts} 次: CF 升级到 hCaptcha 图像题,自动无法过,"
+                        f"立即失败(已写 checkpoint 可下次续爬)"
+                    )
+                    raise CFChallengeEscalated("hcaptcha image challenge")
+                else:
+                    # 普通 5秒盾 JS challenge: 5s 后自动 redirect
+                    last_stage = "cf_shield"
+                    logger.info(
+                        f"  fetch 第 {attempts} 次: 遇 Cloudflare 5秒盾,等 5s 后重试"
+                    )
+                    time.sleep(5)
+                    continue
             # 检测目标元素
             try:
                 tab.ele(target_selector, timeout=8)
@@ -304,6 +449,9 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
             logger.warning(f"  fetch 第 {attempts} 次: 页面断开 {e}, 等 2s 后重试")
             time.sleep(2)
             continue
+        except CFChallengeEscalated:
+            # hCaptcha 图像题等不可自动过的情形 — 直接抛出,不重试不睡
+            raise
         except Exception as e:
             last_stage = f"{type(e).__name__}"
             logger.warning(
@@ -421,6 +569,10 @@ def run_with_retry(keyword: str) -> int:
 
     page = ChromiumPage(options)
     logger.info(f"Chrome 已启动 (address={options.address})—— {MAX_ATTEMPTS} 次 attempt 共享此实例")
+
+    # CF cookie 预热:用户在 data/cf_cookies.json 留了 cf_clearance 就注入,
+    # 让 CF 不再弹复选框/5秒盾(若文件不存在或 cookie 已过期则静默跳过)
+    inject_cf_cookies(page)
 
     rc = 1
     try:

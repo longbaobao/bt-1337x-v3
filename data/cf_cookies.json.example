@@ -1,0 +1,16 @@
+[
+  {
+    "name": "cf_clearance",
+    "value": "PASTE_YOUR_CF_CLEARANCE_VALUE_HERE",
+    "domain": ".1337x.to",
+    "path": "/",
+    "expiry": 1735689600
+  },
+  {
+    "name": "__cf_bm",
+    "value": "PASTE_YOUR_CF_BM_VALUE_HERE",
+    "domain": ".1337x.to",
+    "path": "/",
+    "expiry": 1735689600
+  }
+]

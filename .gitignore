@@ -7,6 +7,7 @@ data/html/*.parsed.txt
 data/html/_progress.log
 data/keys-done.txt
 data/checkpoints/
+data/cf_cookies.json
 !data/html/.gitkeep
 .claude/worktrees/
 .idea/
