@@ -321,31 +321,52 @@ def _find_turnstile_iframe(tab):
     return None
 
 
-def _cdp_click(tab, x: float, y: float, steps: int = 6, step_sleep: float = 0.04):
+def _cdp_click(tab, x: float, y: float, steps: int = 12, step_sleep: float = 0.03):
     """直接走 CDP Input.dispatchMouseEvent 发真实鼠标事件(isTrusted=true)。
 
-    steps 个 mousemove 中间点(step_sleep 秒间隔)→ mousedown → mouseup,
-    模拟真实用户的鼠标轨迹。CF Turnstile 接受 isTrusted=true 的事件。
+    关键:CDP 参数 `buttons` 是 INTEGER bitmask (1=left, 2=right, 4=middle),
+    不是字符串 "left"!上一版传 `buttons="left"` 是非法参数,Chrome 静默
+    丢弃事件(没报错但点击根本没触发)—— CF Turnstile 因此从来没收到过点击。
+
+    鼠标轨迹:从远处 (-200, -200 偏移) 平滑走到目标,12 步 mousemove,
+    模拟真实用户拖鼠标。Turnstile bot 检测会看轨迹,不能 teleport 到 iframe。
+
+    流程: 远处 mousemove(12 步)→ 50ms 停顿 → mousedown → 50ms → mouseup
     """
+    start_x = max(0, x - 200)
+    start_y = max(0, y - 200)
+    # 第一步:从远处起步(避免 teleport 到 iframe 中心引起 bot 怀疑)
     try:
-        cur = tab._run_cdp("Input.dispatchMouseEvent",
-                            type="mouseMoved", x=x, y=y, button="none")
-        # cur 一般返回当前位置;如果浏览器已记录 cursor,新 mousemove 会接着走
+        tab._run_cdp("Input.dispatchMouseEvent",
+                      type="mouseMoved",
+                      x=start_x, y=start_y,
+                      button="none", buttons=0, clickCount=1)
+    except Exception as e:
+        logger.debug(f"mousemove 起点失败: {e}")
+    # 中间步骤:从 start 平滑走到目标 (steps 个中间点)
+    try:
         for i in range(1, steps + 1):
+            interp_x = start_x + (x - start_x) * (i / steps)
+            interp_y = start_y + (y - start_y) * (i / steps)
             tab._run_cdp("Input.dispatchMouseEvent",
                           type="mouseMoved",
-                          x=x + (i * 0.5), y=y + (i * 0.5),  # 细微抖动
-                          button="none")
+                          x=interp_x, y=interp_y,
+                          button="none", buttons=0, clickCount=1)
             time.sleep(step_sleep)
     except Exception as e:
-        logger.debug(f"mousemove 失败: {e}")
-    # mousedown + mouseup (clickCount=1)
+        logger.debug(f"mousemove 中间步骤失败: {e}")
+    time.sleep(0.05)  # 到目标后短暂停顿,模拟真实用户
+    # mousedown + mouseup (buttons 是 bitmask 整数!)
     try:
-        tab._run_cdp("Input.dispatchMouseEvent", type="mousePressed",
-                      x=x, y=y, button="left", buttons="left", clickCount=1)
+        tab._run_cdp("Input.dispatchMouseEvent",
+                      type="mousePressed",
+                      x=x, y=y,
+                      button="left", buttons=1, clickCount=1)
         time.sleep(0.05)
-        tab._run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
-                      x=x, y=y, button="left", clickCount=1)
+        tab._run_cdp("Input.dispatchMouseEvent",
+                      type="mouseReleased",
+                      x=x, y=y,
+                      button="left", buttons=0, clickCount=1)
     except Exception as e:
         logger.info(f"mousedown/up 失败: {e}")
         return False
