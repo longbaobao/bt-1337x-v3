@@ -65,12 +65,27 @@ def main():
     check("_get_outer_html" in src,
           "fetch_with_cf_bypass 调 _get_outer_html (跳过 wait.doc_loaded)")
 
-    # 6. _get_outer_html 函数存在 + 走 DOM CDP 直调
+    # 6. _get_outer_html 函数存在 + 走 DOM CDP 直调 + 不带 ["result"] wrapper
     check(hasattr(ck, "_get_outer_html"),
           "_get_outer_html 函数已定义")
     helper_src = inspect.getsource(ck._get_outer_html)
     check("DOM.getOuterHTML" in helper_src,
           "_get_outer_html 走 DOM.getOuterHTML (直接 CDP)")
+    # P0 bug 防御:DrissionPage _run_cdp 已 unwrap result 字段,
+    # 不应再写 ["result"]["outerHTML"] 这种 KeyError 触发写法
+    check('["result"]["outerHTML"]' not in helper_src,
+          '_get_outer_html 不带 ["result"]["outerHTML"] 错误写法')
+    check('["result"]["object"]["objectId"]' not in helper_src,
+          '_get_outer_html 不带 ["result"]["object"]["objectId"] 错误写法')
+    check('["result"]["root"]["backendNodeId"]' not in helper_src,
+          '_get_outer_html 不带 ["result"]["root"]["backendNodeId"] 错误写法')
+    # 应该直接 ["outerHTML"] / ["object"]["objectId"] / ["root"]["backendNodeId"]
+    check('["outerHTML"]' in helper_src,
+          '_get_outer_html 走 ["outerHTML"] (无 result wrapper)')
+    check('["object"]["objectId"]' in helper_src,
+          '_get_outer_html 走 ["object"]["objectId"] (无 result wrapper)')
+    check('["root"]["backendNodeId"]' in helper_src,
+          '_get_outer_html 走 ["root"]["backendNodeId"] (无 result wrapper)')
 
     # 7. run_with_retry 不再设 page.timeouts.page_load = 5
     run_src = inspect.getsource(ck.run_with_retry)

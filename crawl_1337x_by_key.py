@@ -592,16 +592,20 @@ def _get_outer_html(tab) -> str:
     """直接通过 CDP 拿 outerHTML,跳过 DrissionPage 的 tab.html 隐式 wait.doc_loaded()
     (那个默认等 30s 第三方脚本,完全没必要)。
     若 _root_id 还没设(从未调过 tab.ele),先 DOM.getDocument + DOM.resolveNode 拿一次。
+
+    注意:DrissionPage 的 _run_cdp 已 unwrap CDP "result" 字段,
+    直接返回 result dict(参见 chromium_base.py:145 '_run_cdp(...).root.backendNodeId')。
+    所以不要写 ["result"]["root"] — 直接 ["root"]。
     """
     if getattr(tab, "_root_id", None) is None:
         doc = tab._run_cdp("DOM.getDocument")
-        bid = doc["result"]["root"]["backendNodeId"]
+        bid = doc["root"]["backendNodeId"]
         tab._root_id = tab._run_cdp(
             "DOM.resolveNode", backendNodeId=bid
-        )["result"]["object"]["objectId"]
+        )["object"]["objectId"]
     return tab._run_cdp(
         "DOM.getOuterHTML", objectId=tab._root_id
-    )["result"]["outerHTML"]
+    )["outerHTML"]
 
 
 def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45) -> str:
