@@ -21,7 +21,10 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
 # 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-from crawl_1337x_by_key import MONGO_URI, DB_NAME, fetch_with_cf_bypass
+from crawl_1337x_by_key import (
+    MONGO_URI, DB_NAME, fetch_with_cf_bypass,
+    inject_cf_cookies, STEALTH_INIT_JS, maybe_refresh_cf_cookies,
+)
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
 
@@ -282,11 +285,17 @@ def parse_detail(html: str, detail_url: str) -> dict:
 def fetch_one(tab, url: str) -> str:
     """访问详情页并返回 HTML 字符串。Cloudflare 5秒盾由 fetch_with_cf_bypass 自动等待。
 
+    拿到目标元素(刚穿过 CF)后,顺便把浏览器里新鲜的 .1337x.to cookie 写回
+    data/cf_cookies.json,下次启动直接注入省一遍盾(自反馈循环,同 key 爬虫)。
+
     Raises: TimeoutError (目标元素始终未出现) / 原始 DrissionPage 异常。
     """
-    return fetch_with_cf_bypass(
+    html = fetch_with_cf_bypass(
         tab, url, "div.torrent-detail, div.box-info-heading", max_wait=45
     )
+    # 刚穿过 CF → cookie 是新鲜的,自动落盘
+    maybe_refresh_cf_cookies(tab)
+    return html
 
 
 def save_html_cache(detail_url: str, html: str) -> None:
@@ -419,6 +428,10 @@ def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurr
     # 浏览器健康检查：试开一 tab 立即关掉
     try:
         health_tab = browser.new_tab()
+        try:
+            health_tab.add_init_js(STEALTH_INIT_JS)
+        except Exception:
+            pass  # init 失败不阻塞健康检查
         health_tab.close()
     except Exception as e:
         err = f"browser dead, batch aborted: {type(e).__name__}: {e}"
@@ -432,6 +445,11 @@ def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurr
         with sem:
             try:
                 tab = browser.new_tab()
+                # 每个新 tab 也注入 stealth init JS(CDP 是 per-target 注册)
+                try:
+                    tab.add_init_js(STEALTH_INIT_JS)
+                except Exception as e:
+                    logger.debug(f"[{doc['_id'][:8]}] tab stealth init js 失败: {e}")
             except Exception as e:
                 # 浏览器上下文已关闭 / new_tab 失败 —— 单条 doc 标 failed
                 err = f"new_tab failed: {type(e).__name__}: {e}"
@@ -533,6 +551,18 @@ def main() -> None:
                .auto_port(True))
     browser = ChromiumPage(options)
     logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
+
+    # 反检测: navigator.webdriver=false + 补 window.chrome + 修 permissions API,
+    # 让 CF 别一眼判 bot(同 crawl_1337x_by_key)
+    try:
+        browser.add_init_js(STEALTH_INIT_JS)
+        logger.info("已注入 stealth init JS (browser 层级)")
+    except Exception as e:
+        logger.warning(f"注入 stealth init JS 失败: {type(e).__name__}: {e}")
+
+    # CF cookie 预热: 若 data/cf_cookies.json 有 cf_clearance 就注入到 browser,
+    # 后续所有 tab 共享(Network.setCookie 走的是 browser session,跨 tab 生效)。
+    inject_cf_cookies(browser)
 
     try:
         batch_idx = 0
