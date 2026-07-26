@@ -1,7 +1,6 @@
 """测试 now_str：返回 yyyy-mm-dd hh:mm:ss 格式。"""
 import re
-import sys
-sys.path.insert(0, ".")
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 from crawl_detail_1337x import now_str
 
 

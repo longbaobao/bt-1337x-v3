@@ -1,6 +1,5 @@
 """测试 html_cache_path：data/html/<md5>.html。"""
-import sys
-sys.path.insert(0, ".")
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 from pathlib import Path
 from crawl_detail_1337x import html_cache_path
 

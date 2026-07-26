@@ -1,7 +1,6 @@
 """测试 parse_relative_time：将 '4 years ago' 等相对时间转为 yyyy-mm-dd hh:mm:ss。"""
 from datetime import datetime
-import sys
-sys.path.insert(0, ".")
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 from crawl_detail_1337x import parse_relative_time
 
 
