@@ -247,20 +247,64 @@ def _find_turnstile_iframe(tab):
     """直接 CDP 找 Turnstile iframe,返回 (objectId, content_box) 或 None。
 
     content_box = (x1, y1, x2, y2) 浏览器视口坐标(content,非 border)。
+
+    实现:用 DOM.performSearch + DOM.getSearchResults(DrissionPage 内部同款模式),
+    不需要 nodeId(避免 DOM.querySelectorAll "Invalid parameters" 错误)。
+    顺便也试一次 DOM.querySelectorAll(nodeId)兜底,有些版本 DrissionPage 行为不同。
     """
+    search_id = None
     try:
         r = tab._run_cdp(
-            "DOM.querySelectorAll",
-            selector='iframe[src*="challenges.cloudflare.com"]',
+            "DOM.performSearch",
+            query='iframe[src*="challenges.cloudflare.com"]',
+            includeUserAgentShadowDOM=True,
         )
+        if r and r.get("resultCount", 0) > 0 and r.get("searchId"):
+            search_id = r["searchId"]
+            nIds = tab._run_cdp(
+                "DOM.getSearchResults",
+                searchId=search_id,
+                fromIndex=0,
+                toIndex=r["resultCount"],
+            )
+        else:
+            nIds = None
     except Exception as e:
-        logger.info(f"querySelectorAll 找 iframe 失败: {e}")
+        logger.info(f"performSearch 找 iframe 失败: {e}")
+        nIds = None
+
+    # 用 searchId 找 nodeId 列表
+    node_ids = []
+    if nIds and nIds.get("nodeIds"):
+        node_ids = [nid for nid in nIds["nodeIds"] if nid != 0]
+
+    # 兜底:如果 performSearch 没拿到(例如 DrissionPage 内部 sandbox 屏蔽),
+    # 用 DOM.querySelectorAll(必须传 nodeId,否则 Invalid parameters)
+    if not node_ids:
+        try:
+            doc = tab._run_cdp("DOM.getDocument")
+            root_node_id = doc["root"]["nodeId"]
+            qsa = tab._run_cdp(
+                "DOM.querySelectorAll",
+                nodeId=root_node_id,
+                selector='iframe[src*="challenges.cloudflare.com"]',
+            )
+            if qsa and qsa.get("nodeIds"):
+                node_ids = [nid for nid in qsa["nodeIds"] if nid != 0]
+        except Exception as e:
+            logger.info(f"querySelectorAll 兜底也失败: {e}")
+
+    # 释放 performSearch handle
+    if search_id:
+        try:
+            tab._run_cdp("DOM.discardSearchResults", searchId=search_id)
+        except Exception:
+            pass
+
+    if not node_ids:
         return None
-    if not r or not r.get("nodeIds"):
-        return None
-    for backend_node_id in r["nodeIds"]:
-        if backend_node_id == 0:
-            continue
+
+    for backend_node_id in node_ids:
         try:
             obj = tab._run_cdp("DOM.resolveNode", backendNodeId=backend_node_id)
             object_id = obj["object"]["objectId"]
