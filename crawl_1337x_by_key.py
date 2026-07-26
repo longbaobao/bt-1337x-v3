@@ -384,15 +384,23 @@ def main(keyword: str, page, coll, started_at: float) -> int:
 
 
 def run_with_retry(keyword: str) -> int:
-    """共享一个 Chrome 实例,最多尝试 MAX_ATTEMPTS 次 main(keyword)。
+    """**真正共享**一个 Chrome 实例,最多尝试 MAX_ATTEMPTS 次 main(keyword)。
 
-    关键设计:Chrome 只在第 1 次尝试前启动,失败后退出当前 Chrome、重启新的;
-    浏览器/CF cookie 状态不跨 attempts 保留(否则前次失败时的卡死状态可能带过来)。
+    关键设计:ChromiumPage 在循环外**只创建一次**,所有 attempt 复用同一 page 对象
+    —— 节省每次重启 Chrome 的 ~12s 启动时间 + CF 盾重新挑战的开销,
+    且同一 Chrome 内 cf_clearance cookie / 浏览器状态跨 attempt 保留,
+    第 2 次起基本秒过 CF。Chrome 在外层 finally 统一 quit()。
+
+    如果某次 attempt 把 page 弄到崩溃态(main() 抛异常),后续 attempt 会复用这个
+    坏的 page;此时 fetch_with_cf_bypass 内部的 PageDisconnectedError 重试仍
+    会失败,最终该 attempt 整体失败被记入 rc,下次 attempt 仍复用同一 page
+    (其实已不可用,会一直失败直到 MAX_ATTEMPTS 用尽)。这是有意识的简化:
+    真要 page 复活应靠 wrapper 重跑(新 subprocess → 新 Chrome)。
 
     返回 0=全部爬完,非 0=MAX_ATTEMPTS 次都失败。
     """
     env_val = os.environ.get(ENV_CONCURRENCY, "").strip()
-    logger.info(f"=== 开始抓取 keyword={keyword!r} (最多 {MAX_ATTEMPTS} 次,每次自启 Chrome) ===")
+    logger.info(f"=== 开始抓取 keyword={keyword!r} (最多 {MAX_ATTEMPTS} 次,共享 Chrome) ===")
     if env_val:
         logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本脚本单 key 单进程,仅记录)")
     started_at = time.time()
@@ -411,31 +419,33 @@ def run_with_retry(keyword: str) -> int:
                # .set_argument("--headless")
                .auto_port(True))
 
-    rc = 1
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        page = None
-        try:
-            page = ChromiumPage(options)
-            logger.info(f"[尝试 {attempt}/{MAX_ATTEMPTS}] Chrome 已启动 (address={options.address})")
-            rc = main(keyword, page, coll, started_at)
-            if rc == 0:
-                return 0
-        except Exception as e:
-            logger.error(f"[尝试 {attempt}] 异常: {type(e).__name__}: {e}")
-            rc = 99
-        finally:
-            if page is not None:
-                try:
-                    page.quit()
-                    logger.info(f"[尝试 {attempt}] Chrome 已关闭")
-                except Exception as e:
-                    logger.warning(f"[尝试 {attempt}] 关闭 Chrome 异常: {type(e).__name__}: {e}")
+    page = ChromiumPage(options)
+    logger.info(f"Chrome 已启动 (address={options.address})—— {MAX_ATTEMPTS} 次 attempt 共享此实例")
 
-        if attempt < MAX_ATTEMPTS:
-            logger.warning(
-                f"[尝试 {attempt}] 失败 rc={rc},{RETRY_BACKOFF}s 后从中断页续爬"
-            )
-            time.sleep(RETRY_BACKOFF)
+    rc = 1
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            logger.info(f"[尝试 {attempt}/{MAX_ATTEMPTS}] {keyword}")
+            try:
+                rc = main(keyword, page, coll, started_at)
+                if rc == 0:
+                    return 0
+            except Exception as e:
+                logger.error(f"[尝试 {attempt}] 异常: {type(e).__name__}: {e}")
+                rc = 99
+
+            if attempt < MAX_ATTEMPTS:
+                logger.warning(
+                    f"[尝试 {attempt}] 失败 rc={rc},{RETRY_BACKOFF}s 后从中断页续爬"
+                )
+                time.sleep(RETRY_BACKOFF)
+    finally:
+        # 统一关闭 Chrome(只关一次,不管几次 attempt)
+        try:
+            page.quit()
+            logger.info("Chrome 已关闭")
+        except Exception as e:
+            logger.warning(f"关闭 Chrome 异常: {type(e).__name__}: {e}")
 
     logger.error(f"=== 失败 keyword={keyword} {MAX_ATTEMPTS} 次尝试均失败 ===")
     return rc
