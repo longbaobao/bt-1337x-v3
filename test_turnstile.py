@@ -94,8 +94,8 @@ def main():
           "CFChallengeEscalated 异常类已定义")
 
     # 7. CF 标记常量存在
-    check(hasattr(ck, "_TURNSTILE_IFRAME_MARKER"),
-          "_TURNSTILE_IFRAME_MARKER 已定义")
+    check(hasattr(ck, "_TURNSTILE_MARKERS"),
+          "_TURNSTILE_MARKERS 已定义(v2: 多 marker)")
     check(hasattr(ck, "_HCAPTCHA_MARKERS"),
           "_HCAPTCHA_MARKERS 已定义")
 

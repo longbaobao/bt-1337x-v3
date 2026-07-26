@@ -43,8 +43,43 @@ COLL_NAME = "bt_info_list"
 CDP_URL = "http://127.0.0.1:9222"
 
 # CF 复选框/图像题分流标记(纯字符串检测用,不看 DOM 元素)
-_TURNSTILE_IFRAME_MARKER = "challenges.cloudflare.com"  # Turnstile 复选框 iframe
+# Turnstile 有多个 markup 形式,任一命中即可识别:
+#   - challenges.cloudflare.com  (iframe src,完整加载后才有)
+#   - cf-turnstile               (class,早期 shell 就出现)
+#   - cf-chl-widget              (class,容器)
+#   - data-sitekey               (属性,JS 渲染前就有)
+#   - turnstile                  (字面,JS 变量/注释里常见)
+_TURNSTILE_MARKERS = (
+    "challenges.cloudflare.com",
+    "cf-turnstile",
+    "cf-chl-widget",
+    "data-sitekey",
+    "turnstile",
+)
 _HCAPTCHA_MARKERS = ("hcaptcha.com",)                   # hCaptcha 图像题
+
+# 反检测: 在每个新文档加载前执行,屏蔽 CDP 指纹
+# (navigator.webdriver = true 是 DrissionPage/Selenium 默认,CF 用它判 bot)
+STEALTH_INIT_JS = """
+// 1. navigator.webdriver 改成 false
+Object.defineProperty(Navigator.prototype, 'webdriver', {
+    get: () => false,
+    configurable: true
+});
+// 2. 删 webdriver 痕迹
+delete Navigator.prototype.__proto__;
+// 3. window.chrome 缺失补上(部分 CF 检查)
+if (!window.chrome) {
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+}
+// 4. permissions API 修复
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+"""
 
 # 用户手动过 CF 后导出的 cookie 文件(JSON list 格式,见 data/cf_cookies.json.example)
 CF_COOKIES_FILE = Path("data/cf_cookies.json")
@@ -167,8 +202,13 @@ def maybe_refresh_cf_cookies(page) -> bool:
 
 
 def detect_turnstile(html: str) -> bool:
-    """页面是否含 Turnstile 复选框 iframe(可自动点)。"""
-    return _TURNSTILE_IFRAME_MARKER in html
+    """页面是否含 Turnstile 复选框(任一 marker 命中即视为 Turnstile)。
+
+    多 marker 检测原因: CF 早期 shell 只渲染"请稍候" + cf-turnstile class,
+    iframe src 要等 JS 注入后才出现。只查 challenges.cloudflare.com 会漏判早期 shell
+    → classifier 走 shield 路径只 sleep 5s → 永远过不去。
+    """
+    return any(m in html for m in _TURNSTILE_MARKERS)
 
 
 def detect_hcaptcha(html: str) -> bool:
@@ -187,46 +227,62 @@ def classify_cf_challenge(html: str) -> str:
     return "none"
 
 
-# Turnstile 复选框 iframe 在沙箱里是 cross-origin,DrissionPage 的 .ele()
-# 默认跨 iframe 自动找 — 下列 selector 按"最容易命中"排序,逐个 fallback
-_TURNSTILE_CHECKBOX_SELECTORS = (
-    "input[type='checkbox']",
-    ".cb-lb",          # Turnstile 复选框容器
-    "#challenge-stage",  # 老版 challenge
+# Turnstile 复选框在沙箱跨域 iframe 里,DOM 访问被挡,只能从父页发鼠标事件
+# CF bot 检测看:
+#   - navigator.webdriver (用 STEALTH_INIT_JS 覆盖)
+#   - 鼠标移动轨迹是否自然 (用 actions.move_to 而不是 ele.click)
+#   - 点击位置是否"太正中" (多点几次不同 offset)
+# Turnstile 复选框大致在 iframe 左下角,所以偏移策略先右下角再扩大
+_TURNSTILE_CLICK_OFFSETS = (
+    (0, 0),       # 中心
+    (-15, 0),     # 偏左 — Turnstile 复选框大致在 iframe 左下角
+    (-15, -10),
+    (-20, -5),
+    (0, -15),
 )
 
 
 def _try_click_turnstile_checkbox(tab) -> bool:
-    """跨 iframe 找 Turnstile 复选框并尝试点击。返回 True = 已点(等待后续验证)。"""
+    """真实模拟鼠标: move_to iframe → click,多个 offset 兜底。
+
+    返回 True = 已发点击事件(等下次循环 fetch 看是否过盾)。
+    返回 False = 连 iframe 都找不到(可能早期 shell 还没加载完)。
+    """
     try:
-        # 给 iframe 加载留 1-2s
         iframe = tab.ele("iframe[src*='challenges.cloudflare.com']", timeout=3)
     except Exception as e:
-        logger.debug(f"找 Turnstile iframe 失败: {e}")
+        logger.info(f"找 Turnstile iframe 失败: {e}")
         return False
     if not iframe:
-        return False
-    # DrissionPage 的 ele() 默认跨 iframe 递归找 — 直接传 selector
-    for sel in _TURNSTILE_CHECKBOX_SELECTORS:
+        # 早期 shell: cf-turnstile class 已有但 iframe src 还没注入,
+        # 等 1s 让 JS 注入完再试一次
+        logger.info("Turnstile iframe 还没注入,等 1s 重试...")
+        time.sleep(1)
         try:
-            cb = iframe.ele(sel, timeout=2)
+            iframe = tab.ele("iframe[src*='challenges.cloudflare.com']", timeout=3)
         except Exception:
-            cb = None
-        if cb:
-            try:
-                cb.click()
-                logger.info(f"已点击 Turnstile 复选框 (selector={sel})")
-                return True
-            except Exception as e:
-                logger.debug(f"点击 {sel} 失败: {e}")
-                continue
-    # 兜底:整个 iframe 任何可见元素点一下(有些 Turnstile 复选框是 div)
+            pass
+        if not iframe:
+            # 真没 iframe 就返回 False,外面按"shield"路径走(原 sleep 5s)
+            return False
+    logger.info(f"找到 Turnstile iframe (rect={iframe.rect.size if hasattr(iframe.rect, 'size') else '?'}),尝试真实点击")
+    # 主路径: page.actions.move_to + click — 生成真实 Input.dispatchMouseEvent 序列
+    # (mousemove 多个中间点 → mousedown → mouseup),CF bot 检测看不到 teleport
+    for ox, oy in _TURNSTILE_CLICK_OFFSETS:
+        try:
+            tab.actions.move_to(iframe, offset_x=ox, offset_y=oy, duration=0.3).click()
+            logger.info(f"  → 已发送真实鼠标点击 (offset={ox},{oy})")
+            return True
+        except Exception as e:
+            logger.info(f"  → 真实点击 (offset={ox},{oy}) 失败: {e}")
+            continue
+    # 兜底: 简单 iframe.click() (无 mousemove 轨迹,可能被 CF 拒)
     try:
         iframe.click()
-        logger.info("已点击 Turnstile iframe 中心(兜底)")
+        logger.info("  → 已发送 iframe.click() (兜底,无移动轨迹)")
         return True
     except Exception as e:
-        logger.debug(f"兜底点击 iframe 失败: {e}")
+        logger.info(f"  → 兜底 iframe.click() 也失败: {e}")
         return False
 
 # 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
@@ -640,6 +696,14 @@ def run_with_retry(keyword: str) -> int:
 
     page = ChromiumPage(options)
     logger.info(f"Chrome 已启动 (address={options.address})—— {MAX_ATTEMPTS} 次 attempt 共享此实例")
+
+    # 反检测: 在每个新文档加载前注入 stealth JS,
+    # 把 navigator.webdriver 改成 false 等(DrissionPage 默认是 true,CF 一眼 bot)
+    try:
+        page.add_init_js(STEALTH_INIT_JS)
+        logger.info("已注入 stealth init JS (navigator.webdriver=false)")
+    except Exception as e:
+        logger.warning(f"注入 stealth init JS 失败: {type(e).__name__}: {e}")
 
     # CF cookie 预热:用户在 data/cf_cookies.json 留了 cf_clearance 就注入,
     # 让 CF 不再弹复选框/5秒盾(若文件不存在或 cookie 已过期则静默跳过)
