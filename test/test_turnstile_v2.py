@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py CF Turnstile 检测 v2 测试。
 
 针对 bug: 上一版 detect_turnstile 只查 'challenges.cloudflare.com' 字面量,

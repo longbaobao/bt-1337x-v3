@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py 断点续爬 checkpoint 助手的最小测试。
 
 直接跑:python test_checkpoint.py

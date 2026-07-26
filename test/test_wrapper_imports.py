@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_keys.py 模块加载 + 重试常量归属测试。
 
 回归测试,防止重试常量再次错放在 wrapper 里。

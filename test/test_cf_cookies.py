@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py cookie 预热助手测试。
 
 针对 CF Turnstile 复选框场景的兜底方案:

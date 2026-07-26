@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py CF 挑战分类测试。
 
 复选框 Turnstile 和 hCaptcha 图像题需要不同处理:
