@@ -42,12 +42,25 @@ def main():
     check(hasattr(ck, "_find_turnstile_iframe"),
           "_find_turnstile_iframe 函数已定义")
     helper_src = inspect.getsource(ck._find_turnstile_iframe)
+    # 主路径用 DOM.performSearch (不需 nodeId)
+    check('DOM.performSearch' in helper_src,
+          "_find_turnstile_iframe 主路径用 DOM.performSearch (无需 nodeId)")
+    check('DOM.getSearchResults' in helper_src,
+          "_find_turnstile_iframe 配合 DOM.getSearchResults 拿 nodeId 列表")
+    # 兜底用 DOM.querySelectorAll (必须传 nodeId)
     check('DOM.querySelectorAll' in helper_src,
-          "_find_turnstile_iframe 走 DOM.querySelectorAll (直接 CDP)")
+          "_find_turnstile_iframe 兜底用 DOM.querySelectorAll")
+    check('DOM.getDocument' in helper_src,
+          "_find_turnstile_iframe 兜底前先 DOM.getDocument 拿 root nodeId")
+    check('root_node_id' in helper_src or "root_nodeId" in helper_src,
+          "querySelectorAll 必须传 nodeId 参数(否则 Invalid parameters)")
     check('"challenges.cloudflare.com"' in helper_src or "challenges.cloudflare.com" in helper_src,
           "_find_turnstile_iframe selector 含 challenges.cloudflare.com")
     check('DOM.getBoxModel' in helper_src,
           "_find_turnstile_iframe 走 DOM.getBoxModel 拿坐标")
+    # 释放 search handle
+    check('discardSearchResults' in helper_src,
+          "_find_turnstile_iframe 释放 performSearch handle(防泄漏)")
 
     # 3. 点击走 _cdp_click → Input.dispatchMouseEvent (真实事件)
     check(hasattr(ck, "_cdp_click"), "_cdp_click 函数已定义")
