@@ -315,6 +315,81 @@ def _checkpoint_path(keyword: str) -> Path:
     return CHECKPOINT_DIR / f"{safe}-{h}.json"
 
 
+class PageTimer:
+    """每页 phase 计时器。多次 start/stop 同名阶段会累加。
+
+    用法:
+        t = PageTimer()
+        t.start("fetch")
+        ... 做工作 ...
+        t.stop("fetch")
+        t.start("parse")
+        ... 做工作 ...
+        t.stop("parse")
+        log = format_phase_log(page_num, total_pages, t, cf_attempts=2)
+    """
+    def __init__(self) -> None:
+        self._acc: dict[str, float] = {}
+        self._inflight: dict[str, float] = {}
+        self._first_start: float | None = None
+
+    def start(self, phase: str) -> None:
+        now = time.perf_counter()
+        self._inflight[phase] = now
+        if self._first_start is None:
+            self._first_start = now
+
+    def stop(self, phase: str) -> None:
+        now = time.perf_counter()
+        started = self._inflight.pop(phase, None)
+        if started is None:
+            return  # 未 start 过,静默
+        self._acc[phase] = self._acc.get(phase, 0.0) + (now - started)
+
+    def to_dict(self) -> dict[str, float]:
+        """返回所有阶段累计时长(秒)。"""
+        return dict(self._acc)
+
+    def total_elapsed(self) -> float:
+        """从首次 start 到现在的总时长(含未 stop 的 in-flight 阶段)。"""
+        if self._first_start is None:
+            return 0.0
+        return time.perf_counter() - self._first_start
+
+
+class _FetchStats:
+    """fetch_with_cf_bypass 的观测计数器(class 属性,主循环读 last_attempts)。"""
+    last_attempts: int = 0
+
+
+def format_phase_log(
+    page_num: int,
+    total_pages: int,
+    timer: PageTimer,
+    cf_attempts: int = 0,
+    items_found: int = 0,
+) -> str:
+    """格式化单页 phase log。
+
+    示例输出:
+        [42/50] fetch=15.3s (cf=2x) parse=0.5s save=0.05s sleep=1.0s items=20 total=17.3s
+    """
+    t = timer.to_dict()
+    parts = [f"[{page_num}/{total_pages}]"]
+    for phase, key in (("fetch", "fetch"), ("parse", "parse"),
+                       ("save", "save"), ("sleep", "sleep")):
+        v = t.get(phase)
+        if v is None:
+            continue
+        suffix = "s"
+        if phase == "fetch" and cf_attempts > 1:
+            suffix = f"s (cf={cf_attempts}x)"
+        parts.append(f"{key}={v:.2f}{suffix}")
+    parts.append(f"items={items_found}")
+    parts.append(f"total={timer.total_elapsed():.2f}s")
+    return " ".join(parts)
+
+
 def load_checkpoint(keyword: str) -> tuple[int, int]:
     """读取 (done_page, last_page)。无 checkpoint 或读取失败返回 (0, 0)。"""
     p = _checkpoint_path(keyword)
@@ -515,14 +590,19 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
     cookie 后再 headless。详见 crawl_1337x_by_key.py 顶部 docstring。
 
     Raises: TimeoutError (目标元素未出现) / 原始 DrissionPage 异常。
+
+    Observability: 每轮循环自增 _FetchStats.last_attempts,main loop 可读出
+    CF 重试次数(用于诊断"为啥这一页这么慢")。
     """
     from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
+    _FetchStats.last_attempts = 0
     deadline = time.time() + max_wait
     attempts = 0
     last_stage = "init"
     while time.time() < deadline:
         attempts += 1
+        _FetchStats.last_attempts = attempts  # 暴露给 main loop 做诊断
         try:
             tab.get(url)
             tab.wait.load_start()
@@ -624,7 +704,11 @@ def main(keyword: str, page, coll, started_at: float) -> int:
             logger.info(f"断点续爬 {keyword}: 已完成 {done_page}/{last_page} 页,从第 {start_page} 页继续")
         else:
             # 首次运行:打开第 1 页,探测总页数并处理
+            timer1 = PageTimer()
+            timer1.start("fetch")
             first_html = load_page_with_retry(page, search_url.format(page=1), 1)
+            timer1.stop("fetch")
+            cf_attempts_1 = _FetchStats.last_attempts
             if first_html is None:
                 logger.error("第 1 页加载失败，无法启动")
                 return 2
@@ -635,23 +719,63 @@ def main(keyword: str, page, coll, started_at: float) -> int:
                 return 3
             last_page = detect_last_page(first_html)
             logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
-            _process(first_html, 1)
+            timer1.start("parse")
+            items1 = parse_listing(first_html, keyword)
+            for it in items1:
+                coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True)
+            timer1.stop("parse")
+            timer1.start("save")
+            save_checkpoint(keyword, 1, last_page)
+            timer1.stop("save")
+            logger.info(f"[1/{last_page}] 解析 {len(items1)} 条(首次页)")
+            logger.info(format_phase_log(
+                page_num=1, total_pages=last_page, timer=timer1,
+                cf_attempts=cf_attempts_1, items_found=len(items1),
+            ))
             done_page = 1
-            save_checkpoint(keyword, done_page, last_page)
             start_page = 2
 
         # 翻 start_page..N
         for n in range(start_page, last_page + 1):
             url = search_url.format(page=n)
+            # 每页 phase 计时,看时间花在哪
+            timer = PageTimer()
+
+            timer.start("fetch")
             html = load_page_with_retry(page, url, n)
+            timer.stop("fetch")
+            cf_attempts = _FetchStats.last_attempts  # fetch_with_cf_bypass 内循环次数
+
+            items_found = 0
             if html is None:
                 logger.warning(f"第 {n} 页重试耗尽，跳过(标记已处理,避免卡住进度)")
             else:
-                _process(html, n)
+                timer.start("parse")
+                # 直接调 parse_listing 取条数(避免 _process 里又重复解析)
+                items = parse_listing(html, keyword)
+                items_found = len(items)
+                new_count = 0
+                for it in items:
+                    if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
+                        new_count += 1
+                timer.stop("parse")
+                logger.info(f"[{n}/{last_page}] 解析 {items_found} 条，新写入 MongoDB {new_count} 条")
+
             # 无论成功/跳过都推进 checkpoint,保证重试单调前进,不会永远卡在同一页
             done_page = n
+            timer.start("save")
             save_checkpoint(keyword, done_page, last_page)
+            timer.stop("save")
+
+            timer.start("sleep")
             time.sleep(PAGE_SLEEP)
+            timer.stop("sleep")
+
+            # Phase log: 一眼看出这一页慢在哪
+            logger.info(format_phase_log(
+                page_num=n, total_pages=last_page, timer=timer,
+                cf_attempts=cf_attempts, items_found=items_found,
+            ))
 
     total = coll.count_documents({"keyword": keyword})
     elapsed = time.time() - started_at
