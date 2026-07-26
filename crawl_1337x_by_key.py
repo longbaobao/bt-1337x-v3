@@ -98,6 +98,74 @@ def inject_cf_cookies(page) -> bool:
         return False
 
 
+def _normalize_cookie(c: dict) -> dict | None:
+    """把 page.cookies() 返回的 CDP cookie dict 清洗成 load_cf_cookies() 接受的子集。
+
+    保留 name/value/domain/path/expires,丢弃 httpOnly/secure/size/session/sameSite/
+    priority 等非持久化字段。注意 page.cookies() 用 'expires'(float 秒),
+    load_cf_cookies() 接受 'expiry'(int 秒) —— 都保留也行,format_cookie 都认。
+    """
+    if not c.get("name") or c.get("value") is None:
+        return None
+    out = {"name": c["name"], "value": c["value"]}
+    if c.get("domain"):
+        out["domain"] = c["domain"]
+    if c.get("path"):
+        out["path"] = c["path"]
+    if c.get("expires"):
+        out["expires"] = c["expires"]
+    return out
+
+
+def maybe_refresh_cf_cookies(page) -> bool:
+    """通过 CF 后,把当前 .1337x.to cookie 写回 CF_COOKIES_FILE(原子写)。
+
+    触发场景: fetch_with_cf_bypass 拿到目标元素(刚刚穿过盾)。此时浏览器里
+    的 cf_clearance / __cf_bm 是新鲜的,自动落盘,下次启动直接注入省一遍盾。
+
+    返回:
+        True  = 写盘了(文件内容变化了)
+        False = 没写(无 cf_clearance / 内容相同 / 写盘失败)
+    """
+    try:
+        raw = page.cookies(all_domains=False, all_info=True)
+    except Exception as e:
+        logger.debug(f"读 cookies 失败(可能是 CDP 抖动): {e}")
+        return False
+    # 过滤: 只留 .1337x.to(含子域),且必须有 cf_clearance 才算真正过 CF
+    domain_cookies = []
+    for c in raw:
+        dom = c.get("domain", "")
+        if not (dom == "1337x.to" or dom.endswith(".1337x.to")):
+            continue
+        n = _normalize_cookie(c)
+        if n:
+            domain_cookies.append(n)
+    if not any(c["name"] == "cf_clearance" for c in domain_cookies):
+        return False
+    # 内容是否变了?
+    existing = load_cf_cookies()
+    if existing == domain_cookies:
+        return False
+    # 原子写
+    try:
+        CF_COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CF_COOKIES_FILE.parent / (CF_COOKIES_FILE.name + ".tmp")
+        tmp.write_text(
+            json.dumps(domain_cookies, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(CF_COOKIES_FILE)
+        logger.info(
+            f"已自动刷新 {CF_COOKIES_FILE} ({len(domain_cookies)} 条 cookie, "
+            f"下次启动直接注入省一遍 CF)"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"写 CF cookie 文件失败: {type(e).__name__}: {e}")
+        return False
+
+
 def detect_turnstile(html: str) -> bool:
     """页面是否含 Turnstile 复选框 iframe(可自动点)。"""
     return _TURNSTILE_IFRAME_MARKER in html
@@ -436,6 +504,9 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
             try:
                 tab.ele(target_selector, timeout=8)
                 last_stage = "ok"
+                # 刚穿过 CF:把浏览器里新鲜的 .1337x.to cookie 写回 cf_cookies.json,
+                # 下次启动直接注入省一遍盾
+                maybe_refresh_cf_cookies(tab)
                 return html
             except ElementNotFoundError:
                 last_stage = "no_target"
