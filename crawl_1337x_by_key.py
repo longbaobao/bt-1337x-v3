@@ -608,6 +608,44 @@ def _get_outer_html(tab) -> str:
     )["outerHTML"]
 
 
+def _selector_exists(tab, selector: str, timeout: float = 8.0) -> bool:
+    """直接 CDP DOM.performSearch 轮询 selector 是否存在,跳过 tab.ele() 内部 wait.doc_loaded()
+    隐式等待(chromium_base.py:454 _find_elements 一进来就 self.wait.doc_loaded(),
+    默认等 page_load timeout,被第三方脚本拖 8s+)。
+
+    返回 True = 在 timeout 内找到;False = 超时未找到。
+
+    轮询间隔 50ms:SSR 页面 tab.get() 完成后 selector 几百 ms 内就在 DOM 里。
+    """
+    deadline = time.perf_counter() + timeout
+    last_search_id: str | None = None
+    while time.perf_counter() < deadline:
+        try:
+            r = tab._run_cdp(
+                "DOM.performSearch", query=selector, includeUserAgentShadowDOM=True
+            )
+            if r and r.get("resultCount", 0) > 0:
+                # 释放 search handle 避免 Chrome 端累积
+                if "searchId" in r:
+                    try:
+                        tab._run_cdp("DOM.discardSearchResults", searchId=r["searchId"])
+                    except Exception:
+                        pass
+                return True
+            # 用完旧的 searchId(可能在某次失败的循环里残留)
+            if last_search_id:
+                try:
+                    tab._run_cdp("DOM.discardSearchResults", searchId=last_search_id)
+                except Exception:
+                    pass
+            last_search_id = r.get("searchId") if r else None
+        except Exception:
+            # CDP 暂时断连(页面正在加载中),等下次轮询
+            pass
+        time.sleep(0.05)
+    return False
+
+
 def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45) -> str:
     """访问 URL, 自动处理 Cloudflare 5秒盾, 轮询直到目标元素出现或超时。
 
@@ -657,13 +695,10 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
             _FetchStats.fetch_subphases["tab.get"] += time.perf_counter() - t0
 
             # 先尝试等目标元素(只等我们要的,不等 page load event)
+            # 用 _selector_exists 直接 CDP DOM.performSearch 轮询,跳过
+            # tab.ele() 内部 self.wait.doc_loaded() 的隐式 8s+ 等。
             t0 = time.perf_counter()
-            selector_found = False
-            try:
-                tab.ele(target_selector, timeout=8)
-                selector_found = True
-            except ElementNotFoundError:
-                pass  # 可能是 CF 盾 / 真没加载完 → 走下面 HTML 检查
+            selector_found = _selector_exists(tab, target_selector, timeout=8)
             _FetchStats.fetch_subphases["tab.ele"] += time.perf_counter() - t0
 
             # 不管 selector 找没找到,都拿 HTML(走直接 CDP 调,无 wait.doc_loaded)
