@@ -48,11 +48,24 @@ def main():
     check("auto_port" not in src, "main() 不调用 auto_port (Chrome 归 run_with_retry 管)")
     check("ChromiumPage(" not in src, "main() 不创建 ChromiumPage")
 
-    # 5. run_with_retry() 创建并管理 Chrome
+    # 5. run_with_retry() 创建并管理 Chrome —— **只创建一次**,循环内不复建
     src = inspect.getsource(ck.run_with_retry)
     check("auto_port" in src, "run_with_retry() 调 auto_port")
-    check("ChromiumPage(" in src, "run_with_retry() 创建 ChromiumPage")
+    n_create = src.count("ChromiumPage(")
+    check(n_create == 1, f"run_with_retry() 只创建 1 次 ChromiumPage (实际 {n_create})")
     check("page.quit()" in src, "run_with_retry() 负责 quit()")
+    # 关键:quit() 应在外层 finally(只调 1 次),不在循环内的 finally
+    n_quit = src.count("page.quit()")
+    check(n_quit == 1, f"page.quit() 只调 1 次 (实际 {n_quit})")
+    # 循环体里不能有 quit,否则每次 attempt 都关 Chrome
+    # 简单粗暴验证:retry loop 内不应出现 page.quit
+    import re
+    loop_body_match = re.search(r"for attempt in.*?time\.sleep\(RETRY_BACKOFF\)", src, re.DOTALL)
+    if loop_body_match:
+        loop_body = loop_body_match.group(0)
+        check("page.quit()" not in loop_body, "retry 循环体内不含 page.quit() (Chrome 不跨 attempt 关)")
+    else:
+        check(False, "未匹配到 retry 循环体,请人工检查")
 
     # 6. main() 不再含 page.quit (Chrome 不归 main 管)
     src = inspect.getsource(ck.main)
