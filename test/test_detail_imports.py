@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_detail_1337x.py 集成最新 CF 处理 的烟雾测试。
 
 验证:

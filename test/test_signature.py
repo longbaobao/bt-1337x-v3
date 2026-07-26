@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py 重构后的签名测试。
 
 重构后:

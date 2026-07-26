@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py CF cookie 自动刷新测试。
 
 行为:

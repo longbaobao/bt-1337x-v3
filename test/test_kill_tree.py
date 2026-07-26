@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_keys.py 进程树 kill 测试。
 
 bug: register_chrome_instance 只跟踪 subprocess PID,kill 时 psutil.Process(sub_pid)

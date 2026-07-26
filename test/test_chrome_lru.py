@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_keys.py Chrome 实例 LRU 注册表测试。
 
 针对诉求: 最多 -c 个 ChromiumPage 实例同时存活,开新前 LRU 关掉最老的。

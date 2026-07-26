@@ -1,3 +1,4 @@
+import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py 空结果页判定的测试。
 
 针对 bug: 空的 table.table-list(0 行)被当成"有效且爬完",写入 done.txt。
