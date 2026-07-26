@@ -22,6 +22,11 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
+# Chrome 实例 LRU 注册(共享 wrapper 的 data/chrome_instances/ 注册表)
+from crawl_1337x_by_keys import (
+    register_chrome_instance, unregister_chrome_instance,
+)
+
 from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
@@ -697,6 +702,15 @@ def run_with_retry(keyword: str) -> int:
     page = ChromiumPage(options)
     logger.info(f"Chrome 已启动 (address={options.address})—— {MAX_ATTEMPTS} 次 attempt 共享此实例")
 
+    # Chrome 实例 LRU 注册:让 wrapper 的 ensure_chrome_capacity 能正确杀掉
+    # 本进程拉起的 Chrome(只杀 parent wrapper PID 会让 Chrome 成孤儿继续跑)
+    try:
+        chrome_pid = page.process_id  # DrissionPage 暴露的浏览器进程 ID
+        register_chrome_instance(pid=os.getpid(), chrome_pid=chrome_pid)
+        logger.info(f"已注册到 Chrome LRU 注册表 (sub_pid={os.getpid()}, chrome_pid={chrome_pid})")
+    except Exception as e:
+        logger.warning(f"注册 Chrome 实例失败: {type(e).__name__}: {e}")
+
     # 反检测: 在每个新文档加载前注入 stealth JS,
     # 把 navigator.webdriver 改成 false 等(DrissionPage 默认是 true,CF 一眼 bot)
     try:
@@ -733,6 +747,11 @@ def run_with_retry(keyword: str) -> int:
             logger.info("Chrome 已关闭")
         except Exception as e:
             logger.warning(f"关闭 Chrome 异常: {type(e).__name__}: {e}")
+        # 注销 LRU 注册表条目
+        try:
+            unregister_chrome_instance(os.getpid())
+        except Exception as e:
+            logger.debug(f"注销 Chrome 实例失败: {e}")
 
     logger.error(f"=== 失败 keyword={keyword} {MAX_ATTEMPTS} 次尝试均失败 ===")
     return rc
