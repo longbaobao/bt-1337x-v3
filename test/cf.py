@@ -2,8 +2,8 @@ import _path  # noqa: F401  — 让 import crawl_xxx 找到项目根
 """crawl_1337x_by_key.py CF 挑战处理全链路测试。
 
 覆盖:
-- load_cf_cookies: 用户手导出 cookie 文件的加载(文件不存在/合法/缺字段/损坏/非 list)
-- maybe_refresh_cf_cookies: 过 CF 后自动写回(过滤域/字段清洗/no-op/异常静默)
+- load_cf_cookies: 用户手导出 cookie 文件的加载 + **去重**(同 name+domain+path 只留 expires 最大的)
+- maybe_refresh_cf_cookies: 过 CF 后自动写回(过滤域/字段清洗/no-op/异常静默/去重)
 - detect_turnstile/detect_hcaptcha/classify_cf_challenge: CF 挑战分类
 - 多 marker 检测(早期 shell 也能识别 Turnstile)
 - STEALTH_INIT_JS(navigator.webdriver=false 等反检测)
@@ -29,7 +29,7 @@ def check(cond, msg):
         failures.append(msg)
 
 
-# ─── load_cf_cookies: 文件加载边界 ─────────────────────────────────────────
+# ─── load_cf_cookies: 文件加载边界 + 去重 ──────────────────────────────
 
 def test_load_cf_cookies():
     print("[load_cf_cookies]")
@@ -86,6 +86,37 @@ def test_load_cf_cookies():
         tmp5 = Path(f.name)
     ck.CF_COOKIES_FILE = tmp5
     check(ck.load_cf_cookies() == [], "顶层不是 list → 返回 []")
+
+    # 去重:同 name + domain + path 的多条,只保留 expires 最大的
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        dups = [
+            {"name": "cf_clearance", "value": "older", "domain": ".1337x.to", "path": "/", "expiry": 1000},
+            {"name": "cf_clearance", "value": "newer", "domain": ".1337x.to", "path": "/", "expiry": 2000},
+            {"name": "cf_clearance", "value": "newest", "domain": ".1337x.to", "path": "/", "expiry": 3000},
+            {"name": "__cf_bm", "value": "bm1", "domain": ".1337x.to", "path": "/", "expiry": 1500},
+        ]
+        json.dump(dups, f)
+        tmp6 = Path(f.name)
+    ck.CF_COOKIES_FILE = tmp6
+    loaded = ck.load_cf_cookies()
+    # 应该 2 条:cf_clearance(newest)+ __cf_bm
+    check(len(loaded) == 2, f"去重:4 条原始 → 2 条 (cf_clearance + __cf_bm) 实际 {len(loaded)}")
+    cf = next((c for c in loaded if c["name"] == "cf_clearance"), None)
+    check(cf is not None and cf["value"] == "newest",
+          f"cf_clearance 留 expires 最大的 'newest' 实际值={cf['value'] if cf else None}")
+    check(cf["expiry"] == 3000, f"cf_clearance expires=3000 实际 {cf['expiry']}")
+
+    # 跨域不同不算重复(同 name 不同 domain 各自保留)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        cross = [
+            {"name": "cf_clearance", "value": "a", "domain": ".1337x.to", "path": "/", "expiry": 1000},
+            {"name": "cf_clearance", "value": "b", "domain": ".other.com", "path": "/", "expiry": 2000},
+        ]
+        json.dump(cross, f)
+        tmp7 = Path(f.name)
+    ck.CF_COOKIES_FILE = tmp7
+    loaded = ck.load_cf_cookies()
+    check(len(loaded) == 2, f"跨域不重复 → 2 条 实际 {len(loaded)}")
 
     check(hasattr(ck, "CF_COOKIES_FILE"), "CF_COOKIES_FILE 常量已定义")
 
