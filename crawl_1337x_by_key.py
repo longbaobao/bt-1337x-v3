@@ -96,11 +96,17 @@ class CFChallengeEscalated(Exception):
 
 
 def load_cf_cookies() -> list[dict]:
-    """读 data/cf_cookies.json,返回合法 cookie 列表。
+    """读 data/cf_cookies.json,返回合法 + **去重**后的 cookie 列表。
 
     合法格式:[{"name": "cf_clearance", "value": "...", "domain": ".1337x.to", ...}, ...]
     - 文件不存在 / JSON 损坏 / 顶层不是 list → 返回 []
     - 缺 name 或 value 的条目 → 跳过
+    - **同 (name, domain, path) 的多条 → 只留 expires 最大的**(否则同名后写覆盖先写,
+      导致最新的 cf_clearance 没生效,CF 仍弹盾)
+
+    bug 复现: 用户多次手导出 cookies,文件累积两条 cf_clearance。
+    DrissionPage `set.cookies` 调 `Storage.setCookies`,后写覆盖先写,
+    只有第二条 cf_clearance 生效(老 cookie 可能已失效)。
     """
     if not CF_COOKIES_FILE.exists():
         return []
@@ -112,30 +118,69 @@ def load_cf_cookies() -> list[dict]:
     if not isinstance(data, list):
         logger.warning(f"{CF_COOKIES_FILE} 顶层不是 list,跳过")
         return []
-    out = []
+    valid = []
     for c in data:
         if not isinstance(c, dict):
             continue
         if not c.get("name") or c.get("value") is None:
             continue
-        out.append(c)
-    if not out and data:
+        valid.append(c)
+    if not valid and data:
         logger.warning(f"{CF_COOKIES_FILE} 里 {len(data)} 条全是无效 cookie(缺 name/value)")
+        return []
+    # 去重:同 (name, domain, path) 只留 expires 最大的
+    dedup: dict[tuple, dict] = {}
+    for c in valid:
+        key = (c["name"], c.get("domain", ""), c.get("path", ""))
+        exp = c.get("expiry") or c.get("expires") or 0
+        try:
+            exp = float(exp)
+        except (TypeError, ValueError):
+            exp = 0
+        existing = dedup.get(key)
+        if existing is None or float(existing.get("expiry") or existing.get("expires") or 0) < exp:
+            dedup[key] = c
+    out = list(dedup.values())
+    if len(out) < len(valid):
+        logger.info(
+            f"  {CF_COOKIES_FILE} 去重: {len(valid)} 条 → {len(out)} 条 "
+            f"(同 name+domain+path 只留 expires 最大的)"
+        )
     return out
 
 
 def inject_cf_cookies(page) -> bool:
-    """把 load_cf_cookies() 读到的 cookie 注入到当前 page。返回 True 表示注入了至少 1 条。"""
+    """把 load_cf_cookies() 读到的 cookie 注入到当前 page。返回 True 表示注入了至少 1 条。
+
+    用 raw CDP `Network.setCookie` 一条条注入(避免 Storage.setCookies 同名覆盖问题
+    + 显式带 domain,确保绑到 .1337x.to 域)。
+    """
     cookies = load_cf_cookies()
     if not cookies:
         return False
-    try:
-        page.set.cookies(cookies)
-        logger.info(f"已注入 {len(cookies)} 条 CF cookie(来自 {CF_COOKIES_FILE})")
-        return True
-    except Exception as e:
-        logger.warning(f"注入 CF cookie 失败: {type(e).__name__}: {e}")
-        return False
+    ok = 0
+    for c in cookies:
+        try:
+            # CDP Network.setCookie 需要 name/value,其他字段可选但建议带
+            params: dict = {"name": c["name"], "value": c["value"]}
+            if c.get("domain"):
+                params["domain"] = c["domain"]
+            if c.get("path"):
+                params["path"] = c["path"]
+            # 兼容 'expiry' 和 'expires' 两种字段名
+            exp = c.get("expiry") or c.get("expires")
+            if exp:
+                try:
+                    params["expires"] = int(float(exp))
+                except (TypeError, ValueError):
+                    pass
+            page._run_cdp("Network.setCookie", **params)
+            ok += 1
+        except Exception as e:
+            logger.warning(f"注入 cookie {c.get('name')} 失败: {type(e).__name__}: {e}")
+    if ok:
+        logger.info(f"已注入 {ok} 条 CF cookie(来自 {CF_COOKIES_FILE},逐条 setCookie 绕开同名覆盖)")
+    return ok > 0
 
 
 def _normalize_cookie(c: dict) -> dict | None:
@@ -158,10 +203,13 @@ def _normalize_cookie(c: dict) -> dict | None:
 
 
 def maybe_refresh_cf_cookies(page) -> bool:
-    """通过 CF 后,把当前 .1337x.to cookie 写回 CF_COOKIES_FILE(原子写)。
+    """通过 CF 后,把当前 .1337x.to cookie 写回 CF_COOKIES_FILE(原子写 + 强去重)。
 
     触发场景: fetch_with_cf_bypass 拿到目标元素(刚刚穿过盾)。此时浏览器里
     的 cf_clearance / __cf_bm 是新鲜的,自动落盘,下次启动直接注入省一遍盾。
+
+    写盘前会**强去重**:同 (name, domain, path) 只留 expires 最大的(避免历史累积
+    的同名 cookie 互相覆盖,导致最新 cf_clearance 没生效)。
 
     返回:
         True  = 写盘了(文件内容变化了)
@@ -172,7 +220,7 @@ def maybe_refresh_cf_cookies(page) -> bool:
     except Exception as e:
         logger.debug(f"读 cookies 失败(可能是 CDP 抖动): {e}")
         return False
-    # 过滤: 只留 .1337x.to(含子域),且必须有 cf_clearance 才算真正过 CF
+    # 过滤: 只留 .1337x.to(含子域)
     domain_cookies = []
     for c in raw:
         dom = c.get("domain", "")
@@ -183,6 +231,8 @@ def maybe_refresh_cf_cookies(page) -> bool:
             domain_cookies.append(n)
     if not any(c["name"] == "cf_clearance" for c in domain_cookies):
         return False
+    # 强去重(防止用户多次手导出累积)
+    domain_cookies = _dedup_cookies_by_name_domain_path(domain_cookies)
     # 内容是否变了?
     existing = load_cf_cookies()
     if existing == domain_cookies:
@@ -204,6 +254,24 @@ def maybe_refresh_cf_cookies(page) -> bool:
     except Exception as e:
         logger.warning(f"写 CF cookie 文件失败: {type(e).__name__}: {e}")
         return False
+
+
+def _dedup_cookies_by_name_domain_path(cookies: list[dict]) -> list[dict]:
+    """同 (name, domain, path) 只留 expires 最大的(返回新 list,保序)。"""
+    out: dict[tuple, dict] = {}
+    for c in cookies:
+        key = (c.get("name", ""), c.get("domain", ""), c.get("path", ""))
+        exp = c.get("expiry") or c.get("expires") or 0
+        try:
+            exp = float(exp)
+        except (TypeError, ValueError):
+            exp = 0
+        existing = out.get(key)
+        if existing is None or float(
+            existing.get("expiry") or existing.get("expires") or 0
+        ) < exp:
+            out[key] = c
+    return list(out.values())
 
 
 def detect_turnstile(html: str) -> bool:
