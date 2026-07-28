@@ -30,8 +30,148 @@ def check(cond, msg):
         failures.append(msg)
 
 
+class FakeCdpTab:
+    def __init__(self):
+        self.calls = []
+
+    def _run_cdp(self, method, **kwargs):
+        self.calls.append((method, kwargs))
+        if method == "DOM.performSearch":
+            return {"resultCount": 1, "searchId": "search-1"}
+        if method == "DOM.getSearchResults":
+            return {"nodeIds": [42]}
+        if method == "DOM.resolveNode":
+            if kwargs.get("nodeId") != 42:
+                raise AssertionError("DOM.resolveNode must receive nodeId=42")
+            return {"object": {"objectId": "object-42"}}
+        if method == "DOM.getBoxModel":
+            return {"model": {"content": [10, 20, 110, 20, 110, 70, 10, 70]}}
+        if method == "DOM.discardSearchResults":
+            return {}
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+
+class FakeShadowCdpTab(FakeCdpTab):
+    def __init__(self, checkbox_after=None):
+        super().__init__()
+        self.checkbox_after = checkbox_after or {"found": True, "checked": True}
+        self.runtime_evals = 0
+        self.clicks = []
+
+    def _run_cdp(self, method, **kwargs):
+        self.calls.append((method, kwargs))
+        if method == "DOM.performSearch":
+            return {"resultCount": 1, "searchId": "search-1"}
+        if method == "DOM.getSearchResults":
+            return {"nodeIds": [42]}
+        if method == "DOM.resolveNode":
+            if kwargs.get("nodeId") != 42:
+                raise AssertionError("DOM.resolveNode must receive nodeId=42")
+            return {"object": {"objectId": "iframe-object"}}
+        if method == "DOM.getBoxModel":
+            return {"model": {"content": [100, 200, 400, 200, 400, 265, 100, 265]}}
+        if method == "DOM.describeNode":
+            if kwargs.get("objectId") != "iframe-object":
+                raise AssertionError("DOM.describeNode must receive iframe objectId")
+            return {"node": {"frameId": "frame-1"}}
+        if method == "Page.createIsolatedWorld":
+            if kwargs.get("frameId") != "frame-1":
+                raise AssertionError("Page.createIsolatedWorld must target the iframe frame")
+            return {"executionContextId": 7}
+        if method == "Runtime.evaluate":
+            if kwargs.get("contextId") != 7:
+                raise AssertionError("Runtime.evaluate must run in the iframe context")
+            self.runtime_evals += 1
+            value = ({"found": True, "checked": False, "x": 28, "y": 32, "w": 24, "h": 24}
+                     if self.runtime_evals == 1 else self.checkbox_after)
+            return {"result": {"value": value}}
+        if method == "Input.dispatchMouseEvent":
+            if kwargs.get("type") in ("mousePressed", "mouseReleased"):
+                self.clicks.append((kwargs["x"], kwargs["y"], kwargs["type"]))
+            return {}
+        if method == "DOM.discardSearchResults":
+            return {}
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+
+class FakeBroadIframeSearchTab(FakeCdpTab):
+    def _run_cdp(self, method, **kwargs):
+        self.calls.append((method, kwargs))
+        if method == "DOM.performSearch":
+            if kwargs.get("query") == "iframe":
+                return {"resultCount": 1, "searchId": "search-iframes"}
+            return {"resultCount": 0, "searchId": "search-specific"}
+        if method == "DOM.getSearchResults":
+            return {"nodeIds": [42]}
+        if method == "DOM.describeNode":
+            return {"node": {
+                "attributes": [
+                    "src", "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/x",
+                    "id", "cf-chl-widget-x",
+                    "title", "Cloudflare security challenge",
+                ],
+                "frameId": "frame-1",
+            }}
+        if method == "DOM.resolveNode":
+            return {"object": {"objectId": "object-42"}}
+        if method == "DOM.getBoxModel":
+            return {"model": {"content": [10, 20, 110, 20, 110, 70, 10, 70]}}
+        if method == "DOM.discardSearchResults":
+            return {}
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+
+def check_find_iframe_uses_node_id():
+    fake = FakeCdpTab()
+    found = ck._find_turnstile_iframe(fake)
+    check(found == ("object-42", (10, 20, 110, 70)),
+          "_find_turnstile_iframe correctly resolves DOM search nodeIds")
+    resolve_calls = [kwargs for method, kwargs in fake.calls if method == "DOM.resolveNode"]
+    check(resolve_calls == [{"nodeId": 42}],
+          "_find_turnstile_iframe passes nodeId to DOM.resolveNode")
+
+
+def check_find_iframe_filters_broad_iframe_search():
+    fake = FakeBroadIframeSearchTab()
+    found = ck._find_turnstile_iframe(fake)
+    queries = [kwargs.get("query") for method, kwargs in fake.calls if method == "DOM.performSearch"]
+    check(found == ("object-42", (10, 20, 110, 70)),
+          "_find_turnstile_iframe finds Cloudflare iframe via broad iframe search")
+    check("iframe" in queries,
+          "_find_turnstile_iframe searches all iframes before filtering attributes")
+
+
+def check_shadow_checkbox_coordinates_are_used():
+    fake = FakeShadowCdpTab()
+    found = ck._find_turnstile_iframe(fake)
+    clicked = ck._try_click_turnstile_checkbox(fake)
+    press_points = [(x, y) for x, y, t in fake.clicks if t == "mousePressed"]
+    check(found == ("iframe-object", (100, 200, 400, 265)),
+          "_find_turnstile_iframe returns iframe object and viewport box")
+    check(clicked is True,
+          "_try_click_turnstile_checkbox accepts checked shadow-DOM checkbox after click")
+    check((128, 232) in press_points,
+          "_try_click_turnstile_checkbox clicks real checkbox center from iframe context")
+    check(any(method == "Page.createIsolatedWorld" for method, _ in fake.calls),
+          "_find_turnstile_checkbox_in_frame creates an iframe execution context")
+    check(any(method == "Runtime.evaluate" for method, _ in fake.calls),
+          "_find_turnstile_checkbox_in_frame evaluates checkbox finder inside iframe")
+
+
+def check_fake_shadow_chrome_arg_is_not_used():
+    full_src = open(inspect.getfile(ck), encoding="utf-8").read()
+    check("--enable-blink-features=FakeShadowRoot" not in full_src,
+          "Chrome launch does not use unsupported FakeShadowRoot flag")
+    check(".set_argument(FAKE_SHADOW_ARG)" not in full_src,
+          "run_with_retry does not pass FakeShadowRoot argument to Chrome")
+
+
 def main():
     src = inspect.getsource(ck._try_click_turnstile_checkbox)
+    check_find_iframe_uses_node_id()
+    check_find_iframe_filters_broad_iframe_search()
+    check_shadow_checkbox_coordinates_are_used()
+    check_fake_shadow_chrome_arg_is_not_used()
 
     # 1. 不再用 tab.ele 找 iframe (绕开 wait.doc_loaded)
     check('tab.ele("iframe' not in src,

@@ -318,6 +318,34 @@ _TURNSTILE_CLICK_POSITIONS = (
     (0.50, 0.5),  # 备选 2:iframe 中心
 )
 
+_FIND_TURNSTILE_CHECKBOX_JS = r"""(() => {
+    function find(root) {
+        if (!root) return null;
+        const direct = root.querySelector && root.querySelector('input[type=checkbox]');
+        if (direct) return direct;
+        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (const el of all) {
+            const sr = el.fakeShadowRoot || el.shadowRoot;
+            if (sr) {
+                const nested = find(sr);
+                if (nested) return nested;
+            }
+        }
+        return null;
+    }
+    const cb = find(document);
+    if (!cb) return {found: false};
+    const r = cb.getBoundingClientRect();
+    return {
+        found: true,
+        checked: !!cb.checked,
+        x: r.x + r.width / 2,
+        y: r.y + r.height / 2,
+        w: r.width,
+        h: r.height
+    };
+})()"""
+
 
 def _find_turnstile_iframe(tab):
     """直接 CDP 找 Turnstile iframe,返回 (objectId, content_box) 或 None。
@@ -354,6 +382,36 @@ def _find_turnstile_iframe(tab):
     if nIds and nIds.get("nodeIds"):
         node_ids = [nid for nid in nIds["nodeIds"] if nid != 0]
 
+    # Some Chrome/CDP versions do not match attribute selectors in
+    # DOM.performSearch. Search all iframes and filter attributes ourselves.
+    if not node_ids:
+        search_id = None
+        try:
+            r = tab._run_cdp(
+                "DOM.performSearch",
+                query="iframe",
+                includeUserAgentShadowDOM=True,
+            )
+            search_id = r.get("searchId") if r else None
+            if r and r.get("resultCount", 0) > 0 and search_id:
+                all_iframes = tab._run_cdp(
+                    "DOM.getSearchResults",
+                    searchId=search_id,
+                    fromIndex=0,
+                    toIndex=r["resultCount"],
+                )
+                for node_id in all_iframes.get("nodeIds", []):
+                    if node_id and _is_turnstile_iframe_node(tab, node_id):
+                        node_ids.append(node_id)
+        except Exception as e:
+            logger.info(f"broad iframe search failed: {e}")
+        finally:
+            if search_id:
+                try:
+                    tab._run_cdp("DOM.discardSearchResults", searchId=search_id)
+                except Exception:
+                    pass
+
     # 兜底:如果 performSearch 没拿到(例如 DrissionPage 内部 sandbox 屏蔽),
     # 用 DOM.querySelectorAll(必须传 nodeId,否则 Invalid parameters)
     if not node_ids:
@@ -380,9 +438,9 @@ def _find_turnstile_iframe(tab):
     if not node_ids:
         return None
 
-    for backend_node_id in node_ids:
+    for node_id in node_ids:
         try:
-            obj = tab._run_cdp("DOM.resolveNode", backendNodeId=backend_node_id)
+            obj = tab._run_cdp("DOM.resolveNode", nodeId=node_id)
             object_id = obj["object"]["objectId"]
             box = tab._run_cdp("DOM.getBoxModel", objectId=object_id)
         except Exception:
@@ -395,6 +453,84 @@ def _find_turnstile_iframe(tab):
         x1, y1, x2, y2 = content[0], content[1], content[4], content[5]
         return object_id, (x1, y1, x2, y2)
     return None
+
+
+def _node_attributes(tab, node_id: int) -> dict:
+    desc = tab._run_cdp("DOM.describeNode", nodeId=node_id, depth=1, pierce=True)
+    attrs = ((desc or {}).get("node") or {}).get("attributes") or []
+    return {attrs[i]: attrs[i + 1] for i in range(0, len(attrs) - 1, 2)}
+
+
+def _is_turnstile_iframe_node(tab, node_id: int) -> bool:
+    try:
+        attrs = _node_attributes(tab, node_id)
+    except Exception:
+        return False
+    haystack = " ".join(
+        str(attrs.get(key, "")).lower()
+        for key in ("src", "id", "name", "title")
+    )
+    return (
+        "challenges.cloudflare.com" in haystack
+        or "turnstile" in haystack
+        or "cf-chl-widget" in haystack
+    )
+
+
+def _turnstile_iframe_frame_id(tab, iframe_object_id: str):
+    """Return the frame id for a Turnstile iframe object."""
+    try:
+        desc = tab._run_cdp(
+            "DOM.describeNode",
+            objectId=iframe_object_id,
+            depth=1,
+            pierce=True,
+        )
+    except Exception as e:
+        logger.info(f"describe Turnstile iframe failed: {e}")
+        return None
+
+    node = (desc or {}).get("node") or {}
+    content_doc = node.get("contentDocument") or {}
+    return (
+        node.get("frameId")
+        or node.get("contentFrameId")
+        or content_doc.get("frameId")
+    )
+
+
+def _find_turnstile_checkbox_in_frame(tab, iframe_object_id: str):
+    """Find Turnstile checkbox center inside the challenge iframe."""
+    frame_id = _turnstile_iframe_frame_id(tab, iframe_object_id)
+    if not frame_id:
+        return None
+    try:
+        world = tab._run_cdp(
+            "Page.createIsolatedWorld",
+            frameId=frame_id,
+            worldName="turnstile-checkbox",
+            grantUniveralAccess=True,
+        )
+        context_id = (world or {}).get("executionContextId")
+        if not context_id:
+            return None
+        result = tab._run_cdp(
+            "Runtime.evaluate",
+            expression=_FIND_TURNSTILE_CHECKBOX_JS,
+            contextId=context_id,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+    except Exception as e:
+        logger.info(f"find Turnstile checkbox in iframe failed: {e}")
+        return None
+
+    value = ((result or {}).get("result") or {}).get("value")
+    if not isinstance(value, dict) or not value.get("found"):
+        return None
+    if value.get("w", 0) <= 0 or value.get("h", 0) <= 0:
+        return None
+    return value
 
 
 def _cdp_click(tab, x: float, y: float, steps: int = 12, step_sleep: float = 0.03):
@@ -473,6 +609,27 @@ def _try_click_turnstile_checkbox(tab) -> bool:
     logger.info(
         f"找到 Turnstile iframe ({box_w:.0f}x{box_h:.0f} @ {x1:.0f},{y1:.0f})"
     )
+
+    checkbox = _find_turnstile_checkbox_in_frame(tab, object_id)
+    if checkbox:
+        if checkbox.get("checked"):
+            logger.info("  Turnstile checkbox 已经是 checked")
+            return True
+        click_x = x1 + checkbox["x"]
+        click_y = y1 + checkbox["y"]
+        logger.info(f"  尝试点击真实 checkbox 中心 ({click_x:.0f},{click_y:.0f})")
+        if _cdp_click(tab, click_x, click_y):
+            time.sleep(1.5)
+            after = _find_turnstile_checkbox_in_frame(tab, object_id)
+            if not after or after.get("checked"):
+                logger.info("  ✓ Turnstile checkbox 已 checked 或已消失")
+                return True
+            if not _turnstile_iframe_still_present(tab):
+                logger.info("  ✓ Turnstile iframe 已消失")
+                return True
+            logger.info("  ✗ 真实 checkbox 点击未注册,进入坐标兜底")
+    else:
+        logger.info("  未拿到 iframe 内 checkbox 坐标,进入坐标兜底")
 
     # 2. 依次尝试多个位置(checkbox 实际在 widget 最左 ~8%)
     for frac_x, frac_y in _TURNSTILE_CLICK_POSITIONS:
